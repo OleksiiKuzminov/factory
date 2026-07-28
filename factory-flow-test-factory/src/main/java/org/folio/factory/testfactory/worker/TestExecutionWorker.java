@@ -37,6 +37,9 @@ public class TestExecutionWorker implements AgentWorker {
     private static final long EXECUTION_TIMEOUT_MINUTES = 15;
     static final int MAX_CONSOLE_LOG_CHARS = 20_000;
 
+    /** The only parent variables the runner inherits; everything else is a secret leak. */
+    static final List<String> INHERITED_ENV_VARS = List.of("PATH", "HOME", "JAVA_HOME", "LANG", "TMPDIR");
+
     private final ScriptBundleCodec bundleCodec;
     private final FrontmatterCodec frontmatterCodec;
     private final TestFactoryProperties properties;
@@ -92,6 +95,7 @@ public class TestExecutionWorker implements AgentWorker {
         Path workDir = null;
         try {
             workDir = Files.createTempDirectory("factory-test-factory-run");
+            List<String> command = karateCommand(properties.execution(), workDir, bundle);
             for (ScriptBundle.ScriptFile file : bundle.files()) {
                 Path target = workDir.resolve(file.path()).normalize();
                 if (!target.startsWith(workDir)) {
@@ -100,20 +104,9 @@ public class TestExecutionWorker implements AgentWorker {
                 Files.createDirectories(target.getParent() == null ? workDir : target.getParent());
                 Files.writeString(target, file.content());
             }
-            List<String> command = new ArrayList<>(List.of(
-                    "java", "-jar", properties.execution().karateJar(),
-                    "-o", workDir.resolve("reports").toString()));
-            bundle.files().forEach(f -> command.add(f.path()));
 
-            // Output goes to a file rather than a pipe: reading a pipe would block
-            // until the child exits, which would make the timeout below dead code
-            // for a hung run.
             Path consoleLog = workDir.resolve("karate-console.log");
-            Process process = new ProcessBuilder(command)
-                    .directory(workDir.toFile())
-                    .redirectErrorStream(true)
-                    .redirectOutput(consoleLog.toFile())
-                    .start();
+            Process process = karateProcess(command, workDir, consoleLog, System.getenv()).start();
             if (!process.waitFor(EXECUTION_TIMEOUT_MINUTES, TimeUnit.MINUTES)) {
                 process.destroyForcibly();
                 throw new AgentExecutionException("Karate execution timed out after "
@@ -134,6 +127,67 @@ public class TestExecutionWorker implements AgentWorker {
         }
     }
 
+    /**
+     * Builds the runner argv. The base URL travels as a system property because the
+     * child environment is scrubbed (see {@link #childEnvironment}), and every
+     * generated path is validated and passed as {@code ./path} so the CLI cannot
+     * parse it as an option.
+     */
+    static List<String> karateCommand(TestFactoryProperties.Execution execution, Path workDir, ScriptBundle bundle) {
+        List<String> command = new ArrayList<>(List.of(
+                "java", "-DbaseUrl=" + execution.baseUrl(),
+                "-jar", execution.karateJar(),
+                "-o", workDir.resolve("reports").toString()));
+        for (ScriptBundle.ScriptFile file : bundle.files()) {
+            command.add(scriptArgument(file.path()));
+        }
+        return command;
+    }
+
+    /**
+     * Builds the child process that runs LLM-authored code. Separate from
+     * {@link #executeWithKarate} so a test can inspect the environment the runner would
+     * really be launched with: {@link #childEnvironment} on its own proves nothing
+     * unless the builder's inherited environment is cleared and repopulated from it.
+     */
+    static ProcessBuilder karateProcess(List<String> command, Path workDir, Path consoleLog,
+                                        Map<String, String> parentEnvironment) {
+        // Output goes to a file rather than a pipe: reading a pipe would block until
+        // the child exits, which would make the execution timeout dead code for a
+        // hung run.
+        ProcessBuilder processBuilder = new ProcessBuilder(command)
+                .directory(workDir.toFile())
+                .redirectErrorStream(true)
+                .redirectOutput(consoleLog.toFile());
+        processBuilder.environment().clear();
+        processBuilder.environment().putAll(childEnvironment(parentEnvironment));
+        return processBuilder;
+    }
+
+    static String scriptArgument(String path) {
+        if (!ScriptBundleCodec.isSafePath(path) || !path.endsWith(".feature")) {
+            throw new AgentExecutionException("Refusing to execute generated script path '" + path
+                    + "': expected a relative .feature path of [A-Za-z0-9._-] segments");
+        }
+        return "./" + path;
+    }
+
+    /**
+     * The runner executes LLM-authored code, so it inherits nothing by default: the
+     * factory's own process environment holds the Anthropic key, connector tokens and
+     * the database password.
+     */
+    static Map<String, String> childEnvironment(Map<String, String> parentEnvironment) {
+        Map<String, String> child = new LinkedHashMap<>();
+        for (String name : INHERITED_ENV_VARS) {
+            String value = parentEnvironment.get(name);
+            if (value != null) {
+                child.put(name, value);
+            }
+        }
+        return child;
+    }
+
     private void deleteRecursively(Path directory) {
         try {
             FileSystemUtils.deleteRecursively(directory);
@@ -151,7 +205,10 @@ public class TestExecutionWorker implements AgentWorker {
             JsonNode summary = jsonMapper.readTree(Files.readString(summaryFile));
             for (JsonNode feature : summary.path("featureSummary")) {
                 boolean failed = feature.path("failed").asBoolean(false);
-                filePassed.put(feature.path("relativePath").asString(""), !failed);
+                // Features are passed as ./path, so the summary may echo that prefix
+                // back; bundle paths carry no prefix.
+                String relativePath = feature.path("relativePath").asString("");
+                filePassed.put(relativePath.startsWith("./") ? relativePath.substring(2) : relativePath, !failed);
                 if (failed) {
                     failedFeatures++;
                 } else {

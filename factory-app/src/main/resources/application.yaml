@@ -31,7 +31,8 @@ spring:
     enabled: true
   # REL-1: outbound HTTP client timeouts for the auto-configured RestClient.Builder
   # the Jira/GitHub/TestRail connectors clone (Spring Boot 4 plural `clients`
-  # namespace). The Anthropic LLM client uses its own transport and is unaffected.
+  # namespace). Both LLM clients use their own OkHttp transport and are unaffected;
+  # they are bounded by factory.llm.read-timeout below.
   # Values are Durations; env overrides must also be Durations (e.g. 10s, 500ms).
   http:
     clients:
@@ -42,6 +43,12 @@ spring:
       chat: ${FACTORY_LLM_PROVIDER:anthropic}
     anthropic:
       api-key: ${ANTHROPIC_API_KEY:}
+      # REL-2: the SDK rebuilds its OkHttp client per request from this one Duration
+      # (read + write + call timeouts), overriding anything an
+      # AnthropicHttpClientBuilderCustomizer sets — so this is the only lever that
+      # bounds a hung completion. Left unset the SDK default is 60s, which would kill
+      # a legitimately long completion.
+      timeout: ${factory.llm.read-timeout}
       chat:
         options:
           model: ${FACTORY_LLM_MODEL:claude-sonnet-4-5}
@@ -51,6 +58,7 @@ spring:
     openai:
       api-key: ${FACTORY_LLM_API_KEY:unused}
       base-url: ${FACTORY_LLM_BASE_URL:https://api.groq.com/openai/v1}
+      timeout: ${factory.llm.read-timeout}
       chat:
         completions-path: ${FACTORY_LLM_COMPLETIONS_PATH:/chat/completions}
         options:
@@ -63,6 +71,44 @@ server:
   shutdown: graceful
 
 factory:
+  auth:
+    # SEC-1: console + REST API authentication. On by default; the HITL reviewer
+    # identity is taken from the authenticated principal, never from the request.
+    # Set false only where an authenticating proxy already fronts the app — the
+    # audit ledger then records reviewers as unverified.
+    enabled: ${FACTORY_AUTH_ENABLED:true}
+    # Comma-separated user:password pairs, e.g. "qa-lead:<password>,rel-mgr:<password>".
+    # ',' is the entry separator, so a plain password MUST NOT contain one — it would
+    # be truncated and its tail turned into a second account. For such a password pass
+    # a pre-encoded "{bcrypt}$2a$..." value instead (bcrypt output has no commas).
+    # Usernames are limited to [A-Za-z0-9._@+-] and the resolved set is logged (names
+    # only) at startup, so an account nobody declared is visible in the first screen of
+    # log. When empty a random password is generated for user 'admin' and logged.
+    users: ${FACTORY_AUTH_USERS:}
+    # Let unauthenticated scrapers read /actuator/prometheus and /actuator/metrics.
+    # Health probes are always public; everything else always requires auth.
+    metrics-public: ${FACTORY_AUTH_METRICS_PUBLIC:false}
+  webhooks:
+    # Shared secret accepted in the X-Factory-Webhook-Token header (or the legacy
+    # ?token= query parameter, which leaks into access logs). Unauthenticated while unset.
+    shared-secret: ${FACTORY_WEBHOOKS_SHARED_SECRET:}
+    # GitHub's own HMAC webhook secret. When set, /api/webhooks/github additionally
+    # requires a valid X-Hub-Signature-256 over the raw body.
+    github-secret: ${FACTORY_WEBHOOKS_GITHUB_SECRET:}
+  llm:
+    # REL-2: bounds one model call, wired into spring.ai.<provider>.timeout above.
+    # Without it a hung completion holds an engine worker thread and its step lease.
+    # Must exceed the slowest legitimate completion; raise it before raising
+    # max-step-heartbeat-seconds. There is deliberately no connect-timeout: Spring AI
+    # 2.0's SDK transports rebuild their OkHttp client per request from this single
+    # Duration and leave the connect leg at the SDK's own 1-minute default, so a
+    # connect property here could not reach the socket.
+    read-timeout: ${FACTORY_LLM_READ_TIMEOUT:120s}
+  dashboard:
+    # PERF-2: the dashboard aggregates scan pipeline_execution and the append-only
+    # audit_event table. Serve a snapshot rather than re-running them per request;
+    # 0 disables caching (used by the aggregation tests).
+    stats-cache-ttl: ${FACTORY_DASHBOARD_STATS_CACHE_TTL:30s}
   engine:
     poll-interval-ms: ${FACTORY_ENGINE_POLL_INTERVAL_MS:2000}
     batch-size: ${FACTORY_ENGINE_BATCH_SIZE:5}
@@ -70,6 +116,14 @@ factory:
     # Must exceed the longest legitimate single step (Karate runs are capped at 15
     # min) or the reaper re-queues live executions. Raise if your steps run longer.
     lease-timeout-seconds: ${FACTORY_ENGINE_LEASE_TIMEOUT_SECONDS:1800}
+    # REL-2: while a step runs, the engine refreshes its lease on this cadence so a
+    # legitimately slow step is not reaped and driven a second time concurrently.
+    heartbeat-interval-seconds: ${FACTORY_ENGINE_HEARTBEAT_INTERVAL_SECONDS:60}
+    # Upper bound on that defence. Past it the engine stops refreshing the lease and
+    # lets the reaper recover the execution — otherwise a step wedged on a hung socket
+    # would hold its worker thread and its lease forever. Must exceed the slowest
+    # legitimate step (LLM read-timeout, the 15-min Karate cap).
+    max-step-heartbeat-seconds: ${FACTORY_ENGINE_MAX_STEP_HEARTBEAT_SECONDS:3600}
     # Cadence of the lease reaper + sub-flow reconciliation sweep. Read by the
     # @Scheduled placeholder in ExecutionPoller, not by EngineProperties.
     reap-interval-ms: ${FACTORY_ENGINE_REAP_INTERVAL_MS:30000}
@@ -151,10 +205,11 @@ management:
       # OBS-1: registers /actuator/health/liveness and /actuator/health/readiness probes.
       probes:
         enabled: true
-      # Security-adjacent: exposes db + connector details to unauthenticated callers.
-      # Acceptable for Milestone 1; tighten to when-authorized once the endpoint is
-      # secured (out of scope here).
-      show-details: always
+      # SEC-1: /actuator/health stays public so probes need no credentials, so the db
+      # and connector detail is shown only to an authenticated caller. The aggregate
+      # status (and therefore both probes) is unaffected; with factory.auth.enabled=false
+      # nobody is authenticated, so details are hidden there too — use /status.
+      show-details: when-authorized
       group:
         liveness:
           include: livenessState

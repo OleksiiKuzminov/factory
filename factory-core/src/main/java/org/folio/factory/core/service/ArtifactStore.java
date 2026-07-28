@@ -40,6 +40,10 @@ public class ArtifactStore {
             throw new IllegalArgumentException("Artifact '" + name + "' is " + size
                     + " bytes, exceeding the " + limits.maxArtifactBytes() + "-byte limit");
         }
+        // Allocate the version under a lock on this (executionId, name): concurrent
+        // writers of the same artifact would otherwise read the same max and collide
+        // on uq_artifact_version, losing one write. Released when this transaction ends.
+        repository.lockVersionSequence(executionId + "/" + name);
         int nextVersion = repository.findTopByExecutionIdAndNameOrderByVersionDesc(executionId, name)
                 .map(a -> a.getVersion() + 1)
                 .orElse(1);

@@ -9,6 +9,8 @@ public record EngineProperties(
         Integer batchSize,
         Integer workerThreads,
         Long leaseTimeoutSeconds,
+        Long heartbeatIntervalSeconds,
+        Long maxStepHeartbeatSeconds,
         Integer shutdownAwaitSeconds,
         Boolean reclaimRunningOnStartup) {
 
@@ -20,6 +22,15 @@ public record EngineProperties(
         // Must exceed the longest legitimate single step (Karate runs are capped
         // at 15 minutes) or the reaper re-queues live executions.
         leaseTimeoutSeconds = leaseTimeoutSeconds == null ? 1800L : leaseTimeoutSeconds;
+        // Cadence at which a running step refreshes its own lease, so a merely slow
+        // step is never reaped and driven a second time. Floored at 1s: a zero delay
+        // would spin the heartbeat thread.
+        heartbeatIntervalSeconds = heartbeatIntervalSeconds == null ? 60L : Math.max(1L, heartbeatIntervalSeconds);
+        // Ceiling on that defence. Past it the engine stops refreshing and lets the
+        // reaper recover the execution — a step wedged on a hung socket must stay
+        // reapable, or the heartbeat turns a recoverable stall into a permanent one.
+        // Must exceed the slowest legitimate step (LLM read timeout, Karate's 15-min cap).
+        maxStepHeartbeatSeconds = maxStepHeartbeatSeconds == null ? 3600L : maxStepHeartbeatSeconds;
         // Bounded drain budget on shutdown; a step still running past it is
         // abandoned at forced pool shutdown and recovered by the reaper after
         // leaseTimeoutSeconds. Non-null by construction (used as int below).

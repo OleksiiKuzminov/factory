@@ -9,19 +9,15 @@ import org.springframework.web.bind.annotation.RestController;
 @RequestMapping("/api/dashboard")
 public class DashboardController {
 
-    private static final int MAX_DAYS = 90;
-
     private final DashboardStatsService stats;
 
     public DashboardController(DashboardStatsService stats) {
         this.stats = stats;
     }
 
+    /** An unlisted window is rejected by the service (422), which caches per window. */
     @GetMapping("/stats")
     public DashboardStats stats(@RequestParam(name = "days", defaultValue = "14") int days) {
-        if (days < 1 || days > MAX_DAYS) {
-            throw new IllegalArgumentException("days must be between 1 and " + MAX_DAYS);
-        }
         return stats.compute(days);
     }
 }

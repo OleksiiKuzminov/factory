@@ -28,7 +28,7 @@ class StatusControllerTest {
     void status_reportsEngineFlagConnectorStatesAndFlows() {
         when(flowRegistry.all()).thenReturn(List.of(
                 new FlowDescriptor("test-factory", "Test Factory", "1.0.0", null, null, null, null, null)));
-        EngineProperties engine = new EngineProperties(false, null, null, null, null, null, null);
+        EngineProperties engine = new EngineProperties(false, null, null, null, null, null, null, null, null);
         StatusController controller = new StatusController(
                 List.of(new FakeConnector("jira", true), new FakeConnector("github", false)),
                 flowRegistry, engine);
@@ -45,7 +45,7 @@ class StatusControllerTest {
     @Test
     void status_engineEnabledByDefaultWithNoConnectorsOrFlows() {
         when(flowRegistry.all()).thenReturn(List.of());
-        EngineProperties engine = new EngineProperties(null, null, null, null, null, null, null);
+        EngineProperties engine = new EngineProperties(null, null, null, null, null, null, null, null, null);
         StatusController controller = new StatusController(List.of(), flowRegistry, engine);
 
         Map<String, Object> status = controller.status();

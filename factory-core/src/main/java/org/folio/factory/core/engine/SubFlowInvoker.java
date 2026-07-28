@@ -79,7 +79,9 @@ public class SubFlowInvoker {
 
     /**
      * Called whenever an execution completes. If it is a child, its mapped outputs
-     * are copied up and the parent resumes.
+     * are copied up and the parent resumes. One child per transaction, so the
+     * recovery sweep in {@link SubFlowReconciler} can carry on past a child whose
+     * hand-off cannot be completed.
      */
     @Transactional
     public void onChildCompleted(UUID childExecutionId) {
@@ -91,6 +93,15 @@ public class SubFlowInvoker {
         if (parent.getStatus() != ExecutionStatus.AWAITING_SUBFLOW) {
             log.warn("Child execution {} completed but parent {} is in status {}",
                     childExecutionId, parent.getId(), parent.getStatus());
+            return;
+        }
+        // Guard before any side effect, not after: a refused advance means the parent
+        // is not waiting on THIS child (it is parked on a later SUB_FLOW step, or a
+        // duplicate driver already handed this one back). Copying first would commit a
+        // stale artifact version on every recovery sweep for the rest of the parent's
+        // life — advanceStep returns rather than throws, so nothing rolls the copies back.
+        if (!stateManager.advanceStep(parent.getId(), child.getParentStepIndex(),
+                ExecutionStatus.AWAITING_SUBFLOW)) {
             return;
         }
         FlowDescriptor parentFlow = flowRegistry.require(parent.getFlowId());
@@ -108,56 +119,39 @@ public class SubFlowInvoker {
         }
         auditLog.record(parent.getId(), AuditEventType.SUBFLOW_RETURNED, step.stepId(),
                 Map.of("childExecutionId", child.getId().toString()));
-        if (!stateManager.advanceStep(parent.getId(), child.getParentStepIndex(),
-                ExecutionStatus.AWAITING_SUBFLOW)) {
-            return;
-        }
         stateManager.scheduleRetry(parent.getId(), 0, null);
     }
 
     /**
-     * Recovers parents whose child completed but whose hand-off was lost (process
-     * death between the child's COMPLETED transition and the parent resume).
-     * Invoked periodically by the poller; onChildCompleted is safe to repeat —
-     * the guarded advance refuses duplicates.
+     * Escalates the parent of one child that terminated without completing (rejected
+     * at a gate, failed, cancelled). One child per transaction, so the sweep in
+     * {@link SubFlowReconciler} can carry on past a child whose parent cannot be
+     * escalated.
      */
     @Transactional
-    public void reconcileCompletedChildren() {
-        for (PipelineExecution child : stateManager.findCompletedChildrenWithWaitingParent()) {
-            log.info("Recovering lost sub-flow completion: child {} of parent {}",
-                    child.getId(), child.getParentExecutionId());
-            onChildCompleted(child.getId());
+    public void escalateParentOfTerminatedChild(UUID childExecutionId) {
+        PipelineExecution child = stateManager.get(childExecutionId);
+        if (child.getParentExecutionId() == null) {
+            return;
         }
-    }
-
-    /**
-     * Escalates parents whose child terminated without completing (rejected at a
-     * gate, failed, cancelled). Invoked periodically by the poller so the check is
-     * restart-safe and independent of where the child's terminal transition
-     * happened.
-     */
-    @Transactional
-    public void escalateParentsOfTerminatedChildren() {
-        for (PipelineExecution child : stateManager.findTerminatedChildren()) {
-            PipelineExecution parent = stateManager.get(child.getParentExecutionId());
-            if (parent.getStatus() != ExecutionStatus.AWAITING_SUBFLOW) {
-                continue;
-            }
-            // Surface the dead-end in the review inbox: approving the escalation
-            // resets the SUB_FLOW step and re-invokes the sub-flow. openEscalationReview
-            // performs the FAILED_ESCALATED transition and inserts the review atomically;
-            // a null return means the parent resolved first, so record nothing.
-            StepDescriptor subFlowStep = flowRegistry.require(parent.getFlowId())
-                    .step(child.getParentStepIndex());
-            HitlReview review = hitlGateOpener.openEscalationReview(parent, subFlowStep,
-                    "Sub-flow '" + child.getFlowId() + "' (execution " + child.getId()
-                            + ") terminated with status " + child.getStatus(), 1);
-            if (review != null) {
-                auditLog.record(parent.getId(), AuditEventType.ESCALATED, null,
-                        Map.of("reason", "sub-flow terminated without completing",
-                                "childExecutionId", child.getId().toString(),
-                                "childStatus", child.getStatus().name()));
-            }
+        PipelineExecution parent = stateManager.get(child.getParentExecutionId());
+        if (parent.getStatus() != ExecutionStatus.AWAITING_SUBFLOW) {
+            return;
+        }
+        // Surface the dead-end in the review inbox: approving the escalation
+        // resets the SUB_FLOW step and re-invokes the sub-flow. openEscalationReview
+        // performs the FAILED_ESCALATED transition and inserts the review atomically;
+        // a null return means the parent resolved first, so record nothing.
+        StepDescriptor subFlowStep = flowRegistry.require(parent.getFlowId())
+                .step(child.getParentStepIndex());
+        HitlReview review = hitlGateOpener.openEscalationReview(parent, subFlowStep,
+                "Sub-flow '" + child.getFlowId() + "' (execution " + child.getId()
+                        + ") terminated with status " + child.getStatus(), 1);
+        if (review != null) {
+            auditLog.record(parent.getId(), AuditEventType.ESCALATED, null,
+                    Map.of("reason", "sub-flow terminated without completing",
+                            "childExecutionId", child.getId().toString(),
+                            "childStatus", child.getStatus().name()));
         }
     }
 }

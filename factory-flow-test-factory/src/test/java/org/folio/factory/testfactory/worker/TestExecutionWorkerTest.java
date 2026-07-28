@@ -10,10 +10,16 @@ import org.folio.factory.testfactory.TestFactoryProperties;
 import org.folio.factory.testfactory.artifact.ScriptBundleCodec;
 import org.folio.factory.testfactory.model.ScriptBundle;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
+import org.junit.jupiter.params.ParameterizedTest;
+import org.junit.jupiter.params.provider.EmptySource;
+import org.junit.jupiter.params.provider.NullSource;
+import org.junit.jupiter.params.provider.ValueSource;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.io.IOException;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -65,7 +71,7 @@ class TestExecutionWorkerTest {
     }
 
     @Test
-    void rejectsScriptPathEscapingWorkDirectoryBeforeLaunchingAnything() {
+    void refusesToRunAScriptBundleWithATraversalPathBeforeLaunchingAnything() {
         ScriptBundle bundle = new ScriptBundle("karate", List.of(
                 new ScriptBundle.ScriptFile("../evil.feature", List.of("TC-01"),
                         "Feature: E\n  Scenario: TC-01 escapes")));
@@ -73,8 +79,119 @@ class TestExecutionWorkerTest {
         assertThatThrownBy(() -> worker("http://localhost:9999", "/no/such/karate.jar")
                 .execute(contextWith(bundle)))
                 .isInstanceOf(AgentExecutionException.class)
-                .hasMessageContaining("Script path escapes work directory")
+                .hasMessageContaining("Refusing to execute generated script path")
                 .hasMessageContaining("../evil.feature");
+    }
+
+    @ParameterizedTest
+    @NullSource
+    @EmptySource
+    @ValueSource(strings = {
+            "/etc/cron.d/payload.feature",
+            "../evil.feature",
+            "features/../../evil.feature",
+            "-h.feature",
+            "--backup-dir=/tmp/pwned.feature",
+            "~/pwned.feature",
+            "features\\pwned.feature",
+            "features/pwned .feature",
+            "features/pwned.feature\n-h",
+            "features/pwned.txt",
+            ".feature"})
+    void scriptArgument_hostilePath_isRejectedNamingTheOffendingPath(String path) {
+        assertThatThrownBy(() -> TestExecutionWorker.scriptArgument(path))
+                .isInstanceOf(AgentExecutionException.class)
+                .hasMessageContaining("Refusing to execute generated script path")
+                .hasMessageContaining(String.valueOf(path));
+    }
+
+    @ParameterizedTest
+    @ValueSource(strings = {"a.feature", "features/a.feature", "features/sub-dir/agreements_v2.feature"})
+    void scriptArgument_ordinaryRelativePath_isPassedInAFormNoCliCanReadAsAnOption(String path) {
+        assertThat(TestExecutionWorker.scriptArgument(path)).isEqualTo("./" + path);
+    }
+
+    @Test
+    void karateCommandPassesTheReferenceBaseUrlAsASystemPropertyAndScriptsAsDotSlashPaths(@TempDir Path workDir) {
+        ScriptBundle bundle = new ScriptBundle("karate", List.of(
+                new ScriptBundle.ScriptFile("features/a.feature", List.of("TC-01"), "Feature: A"),
+                new ScriptBundle.ScriptFile("features/b.feature", List.of("TC-02"), "Feature: B")));
+
+        List<String> command = TestExecutionWorker.karateCommand(
+                new TestFactoryProperties.Execution("https://ref.example.org", "/opt/karate.jar"),
+                workDir, bundle);
+
+        assertThat(command).containsExactly("java", "-DbaseUrl=https://ref.example.org",
+                "-jar", "/opt/karate.jar", "-o", workDir.resolve("reports").toString(),
+                "./features/a.feature", "./features/b.feature");
+    }
+
+    @Test
+    void karateCommandRefusesToBuildArgvContainingAnOptionLookingScriptPath(@TempDir Path workDir) {
+        ScriptBundle bundle = new ScriptBundle("karate", List.of(
+                new ScriptBundle.ScriptFile("--configdir=/etc.feature", List.of("TC-01"), "Feature: A")));
+
+        assertThatThrownBy(() -> TestExecutionWorker.karateCommand(
+                new TestFactoryProperties.Execution("https://ref.example.org", "/opt/karate.jar"),
+                workDir, bundle))
+                .isInstanceOf(AgentExecutionException.class)
+                .hasMessageContaining("--configdir=/etc.feature");
+    }
+
+    @Test
+    void childEnvironmentCarriesNoneOfTheFactorySecretsIntoTheGeneratedCodeRunner() {
+        Map<String, String> parentEnvironment = Map.of(
+                "ANTHROPIC_API_KEY", "sk-ant-secret",
+                "FACTORY_CONNECTORS_GITHUB_TOKEN", "ghp-secret",
+                "FACTORY_DB_PASSWORD", "hunter2",
+                "PATH", "/usr/bin",
+                "HOME", "/home/factory",
+                "JAVA_HOME", "/opt/java",
+                "LANG", "C.UTF-8",
+                "TMPDIR", "/tmp");
+
+        Map<String, String> child = TestExecutionWorker.childEnvironment(parentEnvironment);
+
+        assertThat(child).containsOnlyKeys("PATH", "HOME", "JAVA_HOME", "LANG", "TMPDIR");
+        assertThat(child.values()).doesNotContain("sk-ant-secret", "ghp-secret", "hunter2");
+        assertThat(child.get("PATH")).isEqualTo("/usr/bin");
+    }
+
+    @Test
+    void childEnvironmentOmitsMinimalVariablesTheParentDoesNotDefine() {
+        Map<String, String> child = TestExecutionWorker.childEnvironment(Map.of("PATH", "/usr/bin"));
+
+        assertThat(child).containsOnlyKeys("PATH");
+    }
+
+    /**
+     * The containment guarantee only holds where the process is actually built: a
+     * ProcessBuilder inherits the factory's own environment — Anthropic key, connector
+     * tokens, database password — until that is cleared and repopulated from the
+     * allowlist. Asserting {@link TestExecutionWorker#childEnvironment} alone would
+     * still pass with both scrub lines deleted.
+     */
+    @Test
+    void karateProcessLaunchesTheRunnerWithOnlyTheAllowlistedEnvironment(@TempDir Path workDir) {
+        Map<String, String> parentEnvironment = Map.of(
+                "ANTHROPIC_API_KEY", "sk-ant-secret",
+                "FACTORY_CONNECTORS_GITHUB_TOKEN", "ghp-secret",
+                "FACTORY_DB_PASSWORD", "hunter2",
+                "PATH", "/usr/bin",
+                "HOME", "/home/factory");
+        Path consoleLog = workDir.resolve("karate-console.log");
+
+        ProcessBuilder processBuilder = TestExecutionWorker.karateProcess(
+                List.of("java", "-jar", "/opt/karate.jar"), workDir, consoleLog, parentEnvironment);
+
+        assertThat(processBuilder.environment())
+                .containsOnlyKeys("PATH", "HOME")
+                .doesNotContainKeys("ANTHROPIC_API_KEY", "FACTORY_CONNECTORS_GITHUB_TOKEN", "FACTORY_DB_PASSWORD");
+        assertThat(processBuilder.environment().values()).doesNotContain("sk-ant-secret", "ghp-secret", "hunter2");
+        assertThat(processBuilder.directory()).isEqualTo(workDir.toFile());
+        // Console output goes to a file, never a pipe, or the timeout could not fire.
+        assertThat(processBuilder.redirectOutput().file()).isEqualTo(consoleLog.toFile());
+        assertThat(processBuilder.redirectErrorStream()).isTrue();
     }
 
     private static boolean javaOnPath() {

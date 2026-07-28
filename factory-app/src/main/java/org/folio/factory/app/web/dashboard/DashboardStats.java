@@ -9,6 +9,17 @@ public record DashboardStats(Instant generatedAt, int days,
         List<DailyCount> executionsPerDay, List<StepFailureCount> stepFailures, HitlStats hitl,
         List<ConnectorOutcome> connectorOutcomes, TokenUsage tokens, List<StepTokenCount> stepTokens) {
 
+    // One instance is cached and handed to concurrent dashboard requests, so the
+    // mutable ArrayLists JdbcClient returns are copied to genuinely immutable ones.
+    public DashboardStats {
+        executionsByStatus = List.copyOf(executionsByStatus);
+        executionsByFlowAndStatus = List.copyOf(executionsByFlowAndStatus);
+        executionsPerDay = List.copyOf(executionsPerDay);
+        stepFailures = List.copyOf(stepFailures);
+        connectorOutcomes = List.copyOf(connectorOutcomes);
+        stepTokens = List.copyOf(stepTokens);
+    }
+
     public record StatusCount(String status, long count) {
     }
 

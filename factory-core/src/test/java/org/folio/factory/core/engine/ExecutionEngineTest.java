@@ -57,6 +57,9 @@ class ExecutionEngineTest {
     SubFlowInvoker subFlowInvoker;
 
     @Mock
+    StepLeaseHeartbeat stepLeaseHeartbeat;
+
+    @Mock
     JsonMapper jsonMapper;
 
     @Mock
@@ -69,7 +72,7 @@ class ExecutionEngineTest {
     @BeforeEach
     void setUp() {
         engine = new ExecutionEngine(flowRegistry, workerRegistry, stateManager, artifactStore,
-                auditLog, hitlGateOpener, subFlowInvoker, List.of(), jsonMapper, engineMetrics);
+                auditLog, hitlGateOpener, subFlowInvoker, stepLeaseHeartbeat, List.of(), jsonMapper, engineMetrics);
     }
 
     private PipelineExecution executionIn(ExecutionStatus status) {

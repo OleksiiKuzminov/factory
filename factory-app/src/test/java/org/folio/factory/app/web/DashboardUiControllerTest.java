@@ -84,7 +84,7 @@ class DashboardUiControllerTest {
     }
 
     private MockMvc mvcWithConnectors(List<ConnectorHealth> connectors) {
-        EngineProperties engine = new EngineProperties(true, 2000L, 5, 4, 1800L, 30, true);
+        EngineProperties engine = new EngineProperties(true, 2000L, 5, 4, 1800L, 60L, 3600L, 30, true);
         DashboardUiController controller = new DashboardUiController(
                 connectors, flowRegistry, engine, flowRegistryEntries, executions, reviews, audit, json,
                 dashboardStats);
@@ -273,7 +273,26 @@ class DashboardUiControllerTest {
         assertThat(options)
                 .contains(Map.of("value", "HITL_REQUESTED", "label", "Review requested"))
                 .contains(Map.of("value", "SUBFLOW_INVOKED", "label", "Sub-flow invoked"))
-                .contains(Map.of("value", "STATE_TRANSITION", "label", "State transition"));
+                .contains(Map.of("value", "STATE_TRANSITION", "label", "State transition"))
+                .as("a failed connector sync must be filterable, not only visible in the feed")
+                .contains(Map.of("value", "CONNECTOR_FAILED", "label", "Connector failed"));
+    }
+
+    @Test
+    void audit_connectorFailedRowCarriesTheFailureTone() throws Exception {
+        AuditEvent event = new AuditEvent(UUID.randomUUID(), AuditEventType.CONNECTOR_FAILED, "finalize",
+                "worker:test-factory-finalizer", "{\"connector\":\"testrail\"}");
+        when(audit.findAllByOrderByIdDesc(any()))
+                .thenReturn(new PageImpl<>(List.of(event), PageRequest.of(0, 50), 1));
+
+        var result = mvc.perform(get("/audit")).andExpect(status().isOk()).andReturn();
+
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> events =
+                (List<Map<String, Object>>) result.getModelAndView().getModel().get("events");
+        assertThat(events.get(0))
+                .containsEntry("eventLabel", "Connector failed")
+                .containsEntry("eventTone", "destructive");
     }
 
     @Test

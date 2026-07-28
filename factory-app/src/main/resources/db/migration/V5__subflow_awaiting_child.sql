@@ -1,0 +1,18 @@
+-- Deterministic sub-flow correlation for the recovery sweeps.
+--
+-- A parent parked in AWAITING_SUBFLOW is waiting on exactly ONE invocation, and the
+-- sweeps in SubFlowReconciler must ignore every superseded child of the same step
+-- (an approved escalation re-invokes the step under a fresh child; an earlier
+-- SUB_FLOW step's child stays COMPLETED while a later step runs). Picking the
+-- "newest" child by created_at made that decision depend on the wall clock of
+-- whichever instance inserted the row — a backward NTP step or skew between
+-- instances (the engine supports multi-instance operation) makes the fresh child
+-- look no newer, and the parent gets escalated a second time while a legitimately
+-- running child is orphaned under it. This column records the invocation explicitly
+-- and is overwritten on every child creation, so the correlation is exact.
+--
+-- Deliberately no foreign key: it is a correlation marker, not a structural edge
+-- (fk_parent_execution already carries tree integrity), and a dangling value after a
+-- retention purge simply stops the sweep matching, which is the wanted degradation.
+-- No index either: the sweep reaches the parent row by primary key.
+ALTER TABLE pipeline_execution ADD COLUMN awaiting_child_execution_id uuid;

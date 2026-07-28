@@ -2,10 +2,12 @@ package org.folio.factory.app.web;
 
 import org.folio.factory.agents.llm.AbstractLlmAgentWorker;
 import org.folio.factory.agents.prompt.PromptCatalog;
+import org.folio.factory.app.security.CurrentUser;
 import org.folio.factory.core.agent.AgentContext;
 import org.folio.factory.core.agent.AgentResult;
 import org.folio.factory.core.agent.AgentWorker;
 import org.folio.factory.core.agent.AgentWorkerRegistry;
+import org.folio.factory.core.domain.AuditEventType;
 import org.folio.factory.core.registry.FlowRegistry;
 import org.folio.factory.core.registry.FlowValidationException;
 import org.folio.factory.core.registry.model.FlowDescriptor;
@@ -16,6 +18,7 @@ import org.folio.factory.core.registry.model.StepType;
 import org.folio.factory.core.registry.model.SubFlowSpec;
 import org.folio.factory.core.registry.model.TriggerContract;
 import org.folio.factory.core.repository.FlowRegistryEntryRepository;
+import org.folio.factory.core.service.AuditLog;
 import org.folio.factory.core.trigger.PipelineRouter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -68,12 +71,16 @@ class FlowUiControllerTest {
     @Mock
     private PromptCatalog promptCatalog;
 
+    @Mock
+    private AuditLog auditLog;
+
     private MockMvc mvc;
 
     @BeforeEach
     void setUp() {
         mvc = MockMvcBuilders
-                .standaloneSetup(new FlowUiController(flowRegistry, mirror, router, workers, promptCatalog, json))
+                .standaloneSetup(new FlowUiController(flowRegistry, mirror, router, workers, promptCatalog, json,
+                        auditLog))
                 .setViewResolvers(new InternalResourceViewResolver("/templates/", ".html"))
                 .build();
     }
@@ -167,6 +174,32 @@ class FlowUiControllerTest {
                 .andExpect(flash().attribute("message", "Execution started"));
 
         verify(router).routeManual(eq("test-factory"), any(JsonNode.class), isNull());
+    }
+
+    @Test
+    void trigger_authenticatedCaller_auditedAsTheConsoleTriggerActor() throws Exception {
+        UUID executionId = UUID.fromString("00000000-0000-0000-0000-0000000000ef");
+        when(router.routeManual(eq("test-factory"), any(JsonNode.class), isNull())).thenReturn(executionId);
+
+        mvc.perform(post("/flows/{id}/trigger", "test-factory")
+                        .principal(() -> "rel-mgr")
+                        .param("payload", "{}"))
+                .andExpect(status().is3xxRedirection());
+
+        verify(auditLog).record(executionId, AuditEventType.TRIGGER_RECEIVED, null, "rel-mgr",
+                Map.of("flowId", "test-factory", "trigger", "console"));
+    }
+
+    @Test
+    void trigger_withoutPrincipal_auditedAsAnonymous() throws Exception {
+        UUID executionId = UUID.fromString("00000000-0000-0000-0000-0000000000f0");
+        when(router.routeManual(eq("test-factory"), any(JsonNode.class), isNull())).thenReturn(executionId);
+
+        mvc.perform(post("/flows/{id}/trigger", "test-factory").param("payload", "{}"))
+                .andExpect(status().is3xxRedirection());
+
+        verify(auditLog).record(executionId, AuditEventType.TRIGGER_RECEIVED, null, CurrentUser.ANONYMOUS,
+                Map.of("flowId", "test-factory", "trigger", "console"));
     }
 
     @Test

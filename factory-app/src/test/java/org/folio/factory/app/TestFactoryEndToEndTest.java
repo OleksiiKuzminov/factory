@@ -32,7 +32,6 @@ import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
 import java.time.Duration;
-import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -51,17 +50,26 @@ import static org.awaitility.Awaitility.await;
 /**
  * Full Test Factory pipeline through the real poller, REST API, WireMock'd Jira /
  * GitHub / TestRail and a scripted LLM: trigger → triage (Jira fetch) → test
- * plan → QA amend at gate 1 → script generation → advisory execution → QA
- * approve at gate 2 → finalizer syncs all three connectors.
+ * plan → QA amend at gate 1 → script generation → QA approve at the script-review
+ * gate → advisory execution → QA approve at gate 2 → finalizer syncs all three
+ * connectors.
+ *
+ * <p>Runs with authentication ON and drives every REST call over HTTP Basic, so the
+ * pipeline is proven through the real security chain rather than around it, and the
+ * reviewer recorded in the ledger is the container-verified principal.</p>
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT, properties = {
         "spring.ai.model.chat=none",
-        "factory.engine.poll-interval-ms=250"
+        "factory.engine.poll-interval-ms=250",
+        "factory.auth.enabled=true"
 })
 @Import(StubLlmConfiguration.class)
 @Testcontainers
 @DirtiesContext
 class TestFactoryEndToEndTest {
+
+    /** The only account configured above; every REST call authenticates as it. */
+    private static final String REVIEWER = TestAuthCredentials.USER;
 
     @Container
     @ServiceConnection
@@ -73,6 +81,7 @@ class TestFactoryEndToEndTest {
 
     @DynamicPropertySource
     static void connectorProperties(DynamicPropertyRegistry registry) {
+        TestAuthCredentials.register(registry);
         jira.start();
         gitHub.start();
         testRail.start();
@@ -121,7 +130,10 @@ class TestFactoryEndToEndTest {
 
     @BeforeEach
     void setUpClientAndStubs() {
-        rest = RestClient.builder().baseUrl("http://localhost:" + port).build();
+        rest = RestClient.builder()
+                .baseUrl("http://localhost:" + port)
+                .defaultHeaders(headers -> headers.setBasicAuth(REVIEWER, TestAuthCredentials.PASSWORD))
+                .build();
         jira.resetAll();
         gitHub.resetAll();
         testRail.resetAll();
@@ -209,34 +221,53 @@ class TestFactoryEndToEndTest {
         assertThat(planContent).contains("TC-01").contains("TC-02");
         String amendedPlan = planContent + "\n\n> Amended by QA: verified boundary coverage.\n";
 
+        // The body still carries a reviewer name; the server must ignore it and record
+        // the authenticated principal instead (asserted at step 5).
         ResponseEntity<JsonNode> decision1 = rest.post()
                 .uri("/api/hitl/reviews/" + review1.path("id").asString() + "/decision")
                 .contentType(MediaType.APPLICATION_JSON)
-                .body(Map.of("decision", "AMEND", "reviewer", "qa-lead", "comments", "tightened",
+                .body(Map.of("decision", "AMEND", "reviewer", "someone-else", "comments", "tightened",
                         "amendedArtifacts", Map.of("test_plan.md", amendedPlan)))
                 .retrieve()
                 .toEntity(JsonNode.class);
         assertThat(decision1.getStatusCode()).isEqualTo(HttpStatus.OK);
         assertThat(decision1.getBody().path("status").asString()).isEqualTo("AMENDED");
+        assertThat(decision1.getBody().path("reviewer").asString()).isEqualTo(REVIEWER);
 
-        // 3. Wait for HITL gate 2 (sign-off) and approve.
+        // 3. SEC-4: the generated scripts are reviewed by a human before anything runs
+        // them, so this gate opens while test_results.md does not yet exist.
+        JsonNode scriptReview = awaitPendingReview(executionId, "gate-script-review");
+        assertThat(artifactContent(scriptReview, "test_scripts.md")).contains("Feature:");
+        assertThat(artifactStore.getLatest(executionId, "test_results.md")).isEmpty();
+        rest.post()
+                .uri("/api/hitl/reviews/" + scriptReview.path("id").asString() + "/decision")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("decision", "APPROVE"))
+                .retrieve()
+                .toEntity(JsonNode.class);
+
+        // 4. Wait for HITL gate 3 (sign-off) and approve.
         JsonNode review2 = awaitPendingReview(executionId, "gate-2-signoff");
         assertThat(artifactContent(review2, "test_results.md")).contains("ADVISORY");
         rest.post()
                 .uri("/api/hitl/reviews/" + review2.path("id").asString() + "/decision")
                 .contentType(MediaType.APPLICATION_JSON)
-                .body(Map.of("decision", "APPROVE", "reviewer", "qa-lead"))
+                .body(Map.of("decision", "APPROVE"))
                 .retrieve()
                 .toEntity(JsonNode.class);
 
-        // 4. Execution completes.
+        // 5. Execution completes.
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
                 assertThat(stateManager.get(executionId).getStatus()).isEqualTo(ExecutionStatus.COMPLETED));
 
-        // 5. Artifacts: amended plan is v2 and downstream consumed it.
+        // 6. Artifacts: amended plan is v2 and downstream consumed it. The amendment is
+        // attributed to the authenticated principal, not to the name in the request body.
         assertThat(artifactStore.getLatest(executionId, "test_plan.md").orElseThrow().getVersion()).isEqualTo(2);
         assertThat(artifactStore.getLatest(executionId, "test_plan.md").orElseThrow().getCreatedBy())
-                .isEqualTo("hitl:qa-lead");
+                .isEqualTo("hitl:" + REVIEWER);
+        assertThat(reviews.findByExecutionIdOrderByCreatedAtAsc(executionId))
+                .isNotEmpty()
+                .allSatisfy(review -> assertThat(review.getReviewer()).isEqualTo(REVIEWER));
         assertThat(artifactStore.getLatest(executionId, "scope_manifest.md")).isPresent();
         assertThat(artifactStore.getLatest(executionId, "test_scripts.md").orElseThrow().getContent())
                 .contains("Feature: Agreement name validation");
@@ -255,8 +286,9 @@ class TestFactoryEndToEndTest {
                 .contains("**testrail** cases + run: done")
                 .contains("**jira** comment: done");
 
-        // 6. Audit trail covers the whole lifecycle.
-        var eventTypes = auditLog.forExecution(executionId).stream().map(e -> e.getEventType()).toList();
+        // 7. Audit trail covers the whole lifecycle, including all three gates.
+        var events = auditLog.forExecution(executionId);
+        var eventTypes = events.stream().map(e -> e.getEventType()).toList();
         assertThat(eventTypes).containsSubsequence(
                 AuditEventType.EXECUTION_STARTED,
                 AuditEventType.STEP_COMPLETED,
@@ -264,10 +296,19 @@ class TestFactoryEndToEndTest {
                 AuditEventType.HITL_DECIDED,
                 AuditEventType.HITL_REQUESTED,
                 AuditEventType.HITL_DECIDED,
+                AuditEventType.HITL_REQUESTED,
+                AuditEventType.HITL_DECIDED,
                 AuditEventType.CONNECTOR_ACTION,
                 AuditEventType.EXECUTION_COMPLETED);
+        // The caller who spent the run is named in the ledger; the engine's own rows stay 'system'.
+        assertThat(events).filteredOn(e -> e.getEventType() == AuditEventType.TRIGGER_RECEIVED)
+                .singleElement()
+                .satisfies(e -> assertThat(e.getActor()).isEqualTo(REVIEWER));
+        assertThat(events).filteredOn(e -> e.getEventType() == AuditEventType.HITL_DECIDED)
+                .hasSize(3)
+                .allSatisfy(e -> assertThat(e.getActor()).isEqualTo(REVIEWER));
 
-        // 7. External systems really were called.
+        // 8. External systems really were called.
         jira.verify(getRequestedFor(urlEqualTo("/rest/api/2/issue/ERM-1001")));
         jira.verify(postRequestedFor(urlEqualTo("/rest/api/2/issue/ERM-1001/comment")));
         jira.verify(postRequestedFor(urlEqualTo("/rest/api/2/issue/ERM-1001/transitions")));
@@ -277,6 +318,38 @@ class TestFactoryEndToEndTest {
         gitHub.verify(postRequestedFor(urlEqualTo("/repos/folio-org/mod-agreements/pulls")));
         // TestRail: 2 add_case calls + 1 add_run (advisory mode → no results call).
         testRail.verify(3, postRequestedFor(urlPathEqualTo("/index.php")));
+    }
+
+    /**
+     * SEC-4's end-to-end guarantee: the generated Karate features are code derived from
+     * an attacker-influenceable issue, so rejecting them at the script-review gate must
+     * stop the run before the execution step ever runs them.
+     */
+    @Test
+    void rejectingTheScriptReviewGateStopsTheRunBeforeAnythingExecutesTheScripts() {
+        ResponseEntity<JsonNode> triggerResponse = rest.post()
+                .uri("/api/triggers/manual")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("flowId", "test-factory", "payload", Map.of("issueKey", "ERM-1001")))
+                .retrieve()
+                .toEntity(JsonNode.class);
+        UUID executionId = UUID.fromString(triggerResponse.getBody().path("executionId").asString());
+
+        approve(awaitPendingReview(executionId, "gate-1-test-plan"));
+
+        JsonNode scriptReview = awaitPendingReview(executionId, "gate-script-review");
+        rest.post()
+                .uri("/api/hitl/reviews/" + scriptReview.path("id").asString() + "/decision")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("decision", "REJECT", "comments", "reads /etc/passwd"))
+                .retrieve()
+                .toEntity(JsonNode.class);
+
+        await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->
+                assertThat(stateManager.get(executionId).getStatus()).isEqualTo(ExecutionStatus.REJECTED));
+        assertThat(artifactStore.getLatest(executionId, "test_scripts.md")).isPresent();
+        assertThat(artifactStore.getLatest(executionId, "test_results.md")).isEmpty();
+        assertThat(artifactStore.getLatest(executionId, "sync_report.md")).isEmpty();
     }
 
     @Test
@@ -296,7 +369,7 @@ class TestFactoryEndToEndTest {
         ResponseEntity<JsonNode> decision = rest.post()
                 .uri("/api/hitl/reviews/" + review.path("id").asString() + "/decision")
                 .contentType(MediaType.APPLICATION_JSON)
-                .body(Map.of("decision", "AMEND", "reviewer", "qa-lead",
+                .body(Map.of("decision", "AMEND",
                         "amendedArtifacts", Map.of("test_plan.md", "plain text, no frontmatter")))
                 .retrieve()
                 .onStatus(status -> true, (req, res) -> { })
@@ -334,6 +407,15 @@ class TestFactoryEndToEndTest {
                     event.getRequest().getMethod(), event.getRequest().getUrl(),
                     event.getResponse().getStatus(), event.getWasMatched()));
         }
+    }
+
+    private void approve(JsonNode reviewDetail) {
+        rest.post()
+                .uri("/api/hitl/reviews/" + reviewDetail.path("id").asString() + "/decision")
+                .contentType(MediaType.APPLICATION_JSON)
+                .body(Map.of("decision", "APPROVE"))
+                .retrieve()
+                .toEntity(JsonNode.class);
     }
 
     private JsonNode awaitPendingReview(UUID executionId, String gateId) {

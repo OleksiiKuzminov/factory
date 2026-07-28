@@ -153,17 +153,20 @@
   function connectorActions(data) {
     var names = [];
     var executed = {};
+    var failed = {};
     var skipped = {};
     data.connectorOutcomes.forEach(function (r) {
       var name = r.connector || '(unknown)';
       if (names.indexOf(name) === -1) names.push(name);
       if (r.eventType === 'CONNECTOR_ACTION') executed[name] = (executed[name] || 0) + r.count;
+      else if (r.eventType === 'CONNECTOR_FAILED') failed[name] = (failed[name] || 0) + r.count;
       else if (r.eventType === 'CONNECTOR_SKIPPED') skipped[name] = (skipped[name] || 0) + r.count;
     });
     names.sort();
     return {
       labels: names,
       executed: names.map(function (n) { return executed[n] || 0; }),
+      failed: names.map(function (n) { return failed[n] || 0; }),
       skipped: names.map(function (n) { return skipped[n] || 0; })
     };
   }
@@ -318,6 +321,10 @@
       datasets: [
         {
           label: 'Executed', data: t.executed, backgroundColor: T.chart2,
+          borderColor: T.card, borderWidth: 2, borderRadius: 4
+        },
+        {
+          label: 'Failed', data: t.failed, backgroundColor: T.destructive,
           borderColor: T.card, borderWidth: 2, borderRadius: 4
         },
         {

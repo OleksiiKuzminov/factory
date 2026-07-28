@@ -24,7 +24,7 @@ public class ExecutionPoller {
 
     private final ExecutionClaimService claimService;
     private final ExecutionEngine engine;
-    private final SubFlowInvoker subFlowInvoker;
+    private final SubFlowReconciler subFlowReconciler;
     private final EngineProperties properties;
     private final AsyncTaskExecutor executor;
 
@@ -38,11 +38,11 @@ public class ExecutionPoller {
     private boolean startupReclaimDone = false;
 
     public ExecutionPoller(ExecutionClaimService claimService, ExecutionEngine engine,
-                           SubFlowInvoker subFlowInvoker, EngineProperties properties,
+                           SubFlowReconciler subFlowReconciler, EngineProperties properties,
                            AsyncTaskExecutor factoryEngineExecutor) {
         this.claimService = claimService;
         this.engine = engine;
-        this.subFlowInvoker = subFlowInvoker;
+        this.subFlowReconciler = subFlowReconciler;
         this.properties = properties;
         this.executor = factoryEngineExecutor;
     }
@@ -89,8 +89,19 @@ public class ExecutionPoller {
 
     @Scheduled(fixedDelayString = "${factory.engine.reap-interval-ms:30000}")
     public void maintain() {
-        claimService.reapStale(properties.leaseTimeoutSeconds());
-        subFlowInvoker.escalateParentsOfTerminatedChildren();
-        subFlowInvoker.reconcileCompletedChildren();
+        // Each recovery independently: they address unrelated stalls, so a failing one
+        // must not suppress the others — and a throwing @Scheduled method would also
+        // skip everything sequenced after it in the same pass.
+        sweep("lease reap", () -> claimService.reapStale(properties.leaseTimeoutSeconds()));
+        sweep("sub-flow escalation", subFlowReconciler::escalateParentsOfTerminatedChildren);
+        sweep("sub-flow completion", subFlowReconciler::reconcileCompletedChildren);
+    }
+
+    private void sweep(String name, Runnable operation) {
+        try {
+            operation.run();
+        } catch (Exception e) {
+            log.error("Maintenance sweep '{}' failed; the remaining sweeps still ran", name, e);
+        }
     }
 }

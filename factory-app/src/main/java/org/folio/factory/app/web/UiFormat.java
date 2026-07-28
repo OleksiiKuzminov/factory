@@ -103,7 +103,7 @@ final class UiFormat {
     /** Badge tone for an audit event, or null for the neutral outline badge. */
     static String eventTone(AuditEventType type) {
         return switch (type) {
-            case STEP_FAILED, ESCALATED, EXECUTION_BUDGET_EXCEEDED -> "destructive";
+            case STEP_FAILED, ESCALATED, EXECUTION_BUDGET_EXCEEDED, CONNECTOR_FAILED -> "destructive";
             case RETRY_SCHEDULED -> "warning";
             case EXECUTION_COMPLETED -> "success";
             default -> null;

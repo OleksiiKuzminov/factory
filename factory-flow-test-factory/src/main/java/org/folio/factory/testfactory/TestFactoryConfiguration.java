@@ -4,8 +4,8 @@ import org.folio.factory.agents.artifact.FrontmatterCodec;
 import org.folio.factory.connectors.github.GitHubConnector;
 import org.folio.factory.connectors.jira.JiraConnector;
 import org.folio.factory.connectors.testrail.TestRailConnector;
+import org.folio.factory.core.agent.WorkerAuditSink;
 import org.folio.factory.core.metrics.EngineMetrics;
-import org.folio.factory.core.service.AuditLog;
 import org.folio.factory.testfactory.artifact.ScriptBundleCodec;
 import org.folio.factory.testfactory.worker.TestAutomationAgentWorker;
 import org.folio.factory.testfactory.worker.TestExecutionWorker;
@@ -62,9 +62,9 @@ public class TestFactoryConfiguration {
                                                                  FrontmatterCodec frontmatterCodec,
                                                                  ScriptBundleCodec bundleCodec,
                                                                  TestFactoryProperties properties,
-                                                                 AuditLog auditLog,
+                                                                 WorkerAuditSink auditSink,
                                                                  EngineMetrics engineMetrics) {
         return new TestFactoryFinalizerWorker(jiraConnector, gitHubConnector, testRailConnector,
-                frontmatterCodec, bundleCodec, properties, auditLog, engineMetrics);
+                frontmatterCodec, bundleCodec, properties, auditSink, engineMetrics);
     }
 }

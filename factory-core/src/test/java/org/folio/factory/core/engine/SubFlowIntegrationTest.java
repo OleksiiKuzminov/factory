@@ -54,6 +54,9 @@ class SubFlowIntegrationTest {
     SubFlowInvoker subFlowInvoker;
 
     @Autowired
+    SubFlowReconciler subFlowReconciler;
+
+    @Autowired
     HitlReviewRepository reviews;
 
     @Autowired
@@ -130,7 +133,7 @@ class SubFlowIntegrationTest {
         PipelineExecution child = executions.findByParentExecutionId(parent.getId()).getFirst();
         stateManager.transition(child.getId(), ExecutionStatus.REJECTED, null);
 
-        subFlowInvoker.escalateParentsOfTerminatedChildren();
+        subFlowReconciler.escalateParentsOfTerminatedChildren();
 
         assertThat(stateManager.get(parent.getId()).getStatus()).isEqualTo(ExecutionStatus.FAILED_ESCALATED);
         var parentReviews = reviews.findByExecutionIdOrderByCreatedAtAsc(parent.getId());
@@ -148,7 +151,7 @@ class SubFlowIntegrationTest {
         // A child awaiting its own escalation review is resumable — not terminal.
         stateManager.transition(child.getId(), ExecutionStatus.FAILED_ESCALATED, null);
 
-        subFlowInvoker.escalateParentsOfTerminatedChildren();
+        subFlowReconciler.escalateParentsOfTerminatedChildren();
 
         assertThat(stateManager.get(parent.getId()).getStatus()).isEqualTo(ExecutionStatus.AWAITING_SUBFLOW);
     }
@@ -168,6 +171,40 @@ class SubFlowIntegrationTest {
                 .noneMatch(e -> e.getEventType() == AuditEventType.SUBFLOW_INVOKED);
     }
 
+    /**
+     * A hand-off that arrives after the parent has left the step must copy nothing.
+     * The step-cursor guard has to run before the output copies and the
+     * SUBFLOW_RETURNED record: advanceStep refuses by returning false rather than
+     * throwing, so nothing rolls back writes made ahead of it, and a recovery sweep
+     * would append a stale artifact version every pass for the rest of the parent's
+     * life.
+     */
+    @Test
+    void handingBackAChildForAStepTheParentHasLeftWritesNothing() {
+        PipelineExecution parent = stateManager.createExecution("fake-two-subflows", "1.0.0", null);
+        stateManager.transition(parent.getId(), ExecutionStatus.RUNNING, null);
+        engine.advance(parent.getId());
+        PipelineExecution firstChild = executions.findByParentExecutionId(parent.getId()).getFirst();
+        stateManager.transition(firstChild.getId(), ExecutionStatus.RUNNING, null);
+        engine.advance(firstChild.getId());
+        stateManager.transition(parent.getId(), ExecutionStatus.RUNNING, null);
+        engine.advance(parent.getId());
+        PipelineExecution parked = stateManager.get(parent.getId());
+        assertThat(parked.getStatus()).isEqualTo(ExecutionStatus.AWAITING_SUBFLOW);
+        assertThat(parked.getCurrentStepIndex()).isEqualTo(2);
+        int handedBackVersion = artifactStore.getLatest(parent.getId(), "collected.md").orElseThrow().getVersion();
+
+        subFlowInvoker.onChildCompleted(firstChild.getId());
+
+        assertThat(artifactStore.getLatest(parent.getId(), "collected.md").orElseThrow().getVersion())
+                .describedAs("a refused advance must not leave a stale output version behind")
+                .isEqualTo(handedBackVersion);
+        assertThat(auditLog.forExecution(parent.getId()))
+                .filteredOn(e -> e.getEventType() == AuditEventType.SUBFLOW_RETURNED)
+                .hasSize(1);
+        assertThat(stateManager.get(parent.getId()).getCurrentStepIndex()).isEqualTo(2);
+    }
+
     @Test
     void reconcileRecoversLostChildCompletion() {
         PipelineExecution parent = stateManager.createExecution("fake-parent", "1.0.0", null);
@@ -180,7 +217,7 @@ class SubFlowIntegrationTest {
         stateManager.transition(child.getId(), ExecutionStatus.COMPLETED, null);
         assertThat(stateManager.get(parent.getId()).getStatus()).isEqualTo(ExecutionStatus.AWAITING_SUBFLOW);
 
-        subFlowInvoker.reconcileCompletedChildren();
+        subFlowReconciler.reconcileCompletedChildren();
         driveUntilTerminal(parent.getId());
 
         assertThat(stateManager.get(parent.getId()).getStatus()).isEqualTo(ExecutionStatus.COMPLETED);

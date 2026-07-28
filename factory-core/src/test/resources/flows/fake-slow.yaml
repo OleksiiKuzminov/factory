@@ -1,0 +1,12 @@
+# A step that runs longer than the short lease timeout the heartbeat tests configure,
+# but stays inside the heartbeat budget.
+id: fake-slow
+name: Fake Slow Flow
+version: 1.0.0
+agent_chain:
+  - step_id: slow
+    type: AGENT
+    worker_id: slow-worker
+    outputs: [slow.md]
+    config:
+      sleep_millis: 3000

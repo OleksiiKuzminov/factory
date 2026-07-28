@@ -16,6 +16,7 @@ import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
 import org.springframework.context.annotation.Import;
+import org.springframework.dao.DataAccessResourceFailureException;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.web.client.RestClient;
 import org.testcontainers.containers.PostgreSQLContainer;
@@ -23,11 +24,16 @@ import org.testcontainers.junit.jupiter.Container;
 import org.testcontainers.junit.jupiter.Testcontainers;
 import tools.jackson.databind.JsonNode;
 
+import java.time.Duration;
 import java.time.LocalDate;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+import static org.assertj.core.api.Assertions.tuple;
 
 /**
  * Exercises the native Postgres aggregation in {@link DashboardStatsService}
@@ -35,9 +41,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  * asserts the JSON shape the dashboard charts depend on. The service SQL uses
  * {@code date_trunc}, {@code FILTER (WHERE ...)} and {@code detail->>'connector'}
  * that no unit test with a mocked repository can validate.
+ *
+ * <p>The autowired service runs with caching off so the aggregation assertions see
+ * the database rather than a snapshot; the caching behaviour itself is exercised by
+ * the methods below, each against its own service instance and TTL.</p>
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"spring.ai.model.chat=none", "factory.engine.enabled=false"})
+        properties = {"spring.ai.model.chat=none", "factory.engine.enabled=false",
+                "factory.auth.enabled=false", "factory.dashboard.stats-cache-ttl=0s"})
 @Import(StubLlmConfiguration.class)
 @Testcontainers
 class DashboardStatsIntegrationTest {
@@ -74,9 +85,11 @@ class DashboardStatsIntegrationTest {
         rest = RestClient.builder().baseUrl("http://localhost:" + port).build();
     }
 
-    // A single test: the exact-count assertions below depend on seeding running
-    // exactly once, and this class shares one Spring context / database across
-    // methods, so a second @Test that re-seeds would double the counts.
+    // The only test that seeds: the exact-count assertions below depend on seeding
+    // running exactly once, and this class shares one Spring context / database
+    // across methods, so a second @Test that re-seeds would double the counts. The
+    // caching tests below therefore assert on snapshot identity and query counts,
+    // never on row counts.
     @Test
     void aggregatesSeededDataAndSerializesDayAsIsoDateOverHttp() {
         UUID backdatedId = seed();
@@ -121,14 +134,13 @@ class DashboardStatsIntegrationTest {
                 });
 
         assertThat(stats.connectorOutcomes())
-                .anySatisfy(c -> {
-                    assertThat(c.connector()).isEqualTo("github");
-                    assertThat(c.eventType()).isEqualTo(AuditEventType.CONNECTOR_ACTION.name());
-                })
-                .anySatisfy(c -> {
-                    assertThat(c.connector()).isEqualTo("jira");
-                    assertThat(c.eventType()).isEqualTo(AuditEventType.CONNECTOR_SKIPPED.name());
-                });
+                .as("an attempted-and-failed sync stays distinguishable from a successful one")
+                .extracting(DashboardStats.ConnectorOutcome::connector,
+                        DashboardStats.ConnectorOutcome::eventType,
+                        DashboardStats.ConnectorOutcome::count)
+                .contains(tuple("github", AuditEventType.CONNECTOR_ACTION.name(), 1L),
+                        tuple("jira", AuditEventType.CONNECTOR_SKIPPED.name(), 1L),
+                        tuple("testrail", AuditEventType.CONNECTOR_FAILED.name(), 1L));
 
         assertThat(stats.hitl().pending()).isEqualTo(1);
         assertThat(stats.hitl().decidedInWindow()).isEqualTo(1);
@@ -166,6 +178,153 @@ class DashboardStatsIntegrationTest {
         }
     }
 
+    @Test
+    void aSecondCallInsideTheTtlIsServedFromTheSnapshotWithoutQueryingAgain() {
+        AtomicInteger queries = new AtomicInteger();
+        DashboardStatsService service = serviceWithTtl(counting(queries), Duration.ofSeconds(30));
+
+        DashboardStats first = service.compute(7);
+        int afterFirst = queries.get();
+        DashboardStats second = service.compute(7);
+
+        assertThat(afterFirst).isPositive();
+        assertThat(second).isSameAs(first);
+        assertThat(queries.get()).isEqualTo(afterFirst);
+    }
+
+    @Test
+    void theSnapshotIsRecomputedOnceItsTtlHasPassed() throws InterruptedException {
+        AtomicInteger queries = new AtomicInteger();
+        DashboardStatsService service = serviceWithTtl(counting(queries), Duration.ofMillis(100));
+
+        DashboardStats first = service.compute(7);
+        int afterFirst = queries.get();
+        Thread.sleep(150);
+
+        assertThat(service.compute(7)).isNotSameAs(first);
+        assertThat(queries.get()).isGreaterThan(afterFirst);
+    }
+
+    @Test
+    void aZeroTtlDisablesCachingSoEveryCallReRunsTheAggregates() {
+        AtomicInteger queries = new AtomicInteger();
+        DashboardStatsService service = serviceWithTtl(counting(queries), Duration.ZERO);
+
+        DashboardStats first = service.compute(7);
+        int afterFirst = queries.get();
+
+        assertThat(service.compute(7)).isNotSameAs(first);
+        assertThat(queries.get()).isEqualTo(afterFirst * 2);
+    }
+
+    @Test
+    void oneDayWindowNeverServesAnotherWindowsSnapshot() {
+        DashboardStatsService service = serviceWithTtl(jdbc, Duration.ofSeconds(30));
+
+        DashboardStats sevenDay = service.compute(7);
+        DashboardStats thirtyDay = service.compute(30);
+
+        assertThat(sevenDay.days()).isEqualTo(7);
+        assertThat(thirtyDay.days()).isEqualTo(30);
+        assertThat(thirtyDay).isNotSameAs(sevenDay);
+        assertThat(service.compute(7)).isNotSameAs(thirtyDay)
+                .extracting(DashboardStats::days).isEqualTo(7);
+    }
+
+    /**
+     * The dashboard offers five windows and polls every 30s, so two viewers on
+     * different ranges hit the service alternately. With one cache slot each request
+     * would evict the other's snapshot and re-run every aggregate.
+     */
+    @Test
+    void windowsAreCachedSideBySideSoAlternatingViewersDoNotEvictEachOther() {
+        AtomicInteger queries = new AtomicInteger();
+        DashboardStatsService service = serviceWithTtl(counting(queries), Duration.ofSeconds(30));
+
+        DashboardStats sevenDay = service.compute(7);
+        DashboardStats thirtyDay = service.compute(30);
+        int afterBoth = queries.get();
+
+        assertThat(service.compute(7)).isSameAs(sevenDay);
+        assertThat(service.compute(30)).isSameAs(thirtyDay);
+        assertThat(queries.get()).as("both windows stayed cached").isEqualTo(afterBoth);
+    }
+
+    @Test
+    void anUnlistedWindowIsRejectedBeforeAnyQuerySoTheCacheKeySpaceStaysBounded() {
+        AtomicInteger queries = new AtomicInteger();
+        DashboardStatsService service = serviceWithTtl(counting(queries), Duration.ofSeconds(30));
+
+        assertThatThrownBy(() -> service.compute(13))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("[1, 7, 14, 30, 90]");
+        assertThat(queries.get()).isZero();
+
+        Integer status = rest.get().uri("/api/dashboard/stats?days=13")
+                .exchange((request, response) -> response.getStatusCode().value());
+        assertThat(status).as("the REST endpoint surfaces the same constraint").isEqualTo(422);
+    }
+
+    /**
+     * A snapshot is shared by every viewer inside the TTL, so the lists it hands out
+     * must not be the mutable ones {@code JdbcClient} returns.
+     */
+    @Test
+    void servedListsAreImmutableSoOneViewerCannotCorruptTheCachedSnapshot() {
+        DashboardStats stats = serviceWithTtl(jdbc, Duration.ofSeconds(30)).compute(7);
+
+        assertThatThrownBy(() -> stats.executionsByStatus().add(new DashboardStats.StatusCount("HACKED", 1)))
+                .isInstanceOf(UnsupportedOperationException.class);
+        assertThatThrownBy(() -> stats.stepTokens().add(new DashboardStats.StepTokenCount("f", "s", 1, 1)))
+                .isInstanceOf(UnsupportedOperationException.class);
+    }
+
+    @Test
+    void aRefreshThatThrowsIsNotCachedSoTheNextCallRecovers() throws InterruptedException {
+        AtomicBoolean broken = new AtomicBoolean();
+        JdbcClient flaky = sql -> {
+            if (broken.get()) {
+                throw new DataAccessResourceFailureException("database unavailable");
+            }
+            return jdbc.sql(sql);
+        };
+        DashboardStatsService service = serviceWithTtl(flaky, Duration.ofMillis(100));
+
+        DashboardStats first = service.compute(7);
+        broken.set(true);
+        Thread.sleep(150);
+
+        assertThatThrownBy(() -> service.compute(7)).isInstanceOf(DataAccessResourceFailureException.class);
+
+        broken.set(false);
+        assertThat(service.compute(7)).isNotSameAs(first);
+    }
+
+    @Test
+    void theTokenKpiAccessorsReadTheCachedSnapshotRatherThanRequerying() {
+        AtomicInteger queries = new AtomicInteger();
+        DashboardStatsService service = serviceWithTtl(counting(queries), Duration.ofSeconds(30));
+
+        DashboardStats snapshot = service.compute(7);
+        int afterCompute = queries.get();
+
+        assertThat(service.tokenUsage(7)).isEqualTo(snapshot.tokens());
+        assertThat(service.stepTokens(7)).isSameAs(snapshot.stepTokens());
+        assertThat(queries.get()).isEqualTo(afterCompute);
+    }
+
+    private DashboardStatsService serviceWithTtl(JdbcClient client, Duration ttl) {
+        return new DashboardStatsService(client, new DashboardProperties(ttl));
+    }
+
+    /** JdbcClient is a functional interface, so counting statements needs no mocking framework. */
+    private JdbcClient counting(AtomicInteger queries) {
+        return sql -> {
+            queries.incrementAndGet();
+            return jdbc.sql(sql);
+        };
+    }
+
     private UUID seed() {
         PipelineExecution completed = stateManager.createExecution(FLOW_A, "1", "{}");
 
@@ -185,6 +344,8 @@ class DashboardStatsIntegrationTest {
                 Map.of("connector", "github", "action", "open-pr"));
         auditLog.record(completed.getId(), AuditEventType.CONNECTOR_SKIPPED, "finalize",
                 Map.of("connector", "jira", "reason", "unconfigured"));
+        auditLog.record(completed.getId(), AuditEventType.CONNECTOR_FAILED, "finalize",
+                Map.of("connector", "testrail", "reason", "500 from TestRail"));
 
         // Token-bearing completions plus one that reported nothing: the '{}' row must
         // contribute zero to the totals and produce no breakdown row at all.

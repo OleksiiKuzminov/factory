@@ -2,8 +2,10 @@ package org.folio.factory.app.web;
 
 import org.folio.factory.agents.llm.AbstractLlmAgentWorker;
 import org.folio.factory.agents.prompt.PromptCatalog;
+import org.folio.factory.app.security.CurrentUser;
 import org.folio.factory.core.agent.AgentWorker;
 import org.folio.factory.core.agent.AgentWorkerRegistry;
+import org.folio.factory.core.domain.AuditEventType;
 import org.folio.factory.core.domain.FlowRegistryEntry;
 import org.folio.factory.core.limits.DailyBudgetExceededException;
 import org.folio.factory.core.registry.FlowRegistry;
@@ -14,6 +16,7 @@ import org.folio.factory.core.registry.model.StepDescriptor;
 import org.folio.factory.core.registry.model.SubFlowSpec;
 import org.folio.factory.core.registry.model.TriggerContract;
 import org.folio.factory.core.repository.FlowRegistryEntryRepository;
+import org.folio.factory.core.service.AuditLog;
 import org.folio.factory.core.trigger.PipelineRouter;
 import org.springframework.core.io.Resource;
 import org.springframework.core.io.support.PathMatchingResourcePatternResolver;
@@ -30,6 +33,7 @@ import tools.jackson.databind.json.JsonMapper;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.security.Principal;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
@@ -56,17 +60,20 @@ public class FlowUiController {
     private final AgentWorkerRegistry workers;
     private final PromptCatalog promptCatalog;
     private final JsonMapper jsonMapper;
+    private final AuditLog auditLog;
     private final PathMatchingResourcePatternResolver resolver = new PathMatchingResourcePatternResolver();
     private volatile Map<String, List<Map<String, Object>>> samplesByFlow;
 
     public FlowUiController(FlowRegistry flowRegistry, FlowRegistryEntryRepository mirror, PipelineRouter router,
-                            AgentWorkerRegistry workers, PromptCatalog promptCatalog, JsonMapper jsonMapper) {
+                            AgentWorkerRegistry workers, PromptCatalog promptCatalog, JsonMapper jsonMapper,
+                            AuditLog auditLog) {
         this.flowRegistry = flowRegistry;
         this.mirror = mirror;
         this.router = router;
         this.workers = workers;
         this.promptCatalog = promptCatalog;
         this.jsonMapper = jsonMapper;
+        this.auditLog = auditLog;
     }
 
     @GetMapping("/flows")
@@ -102,6 +109,7 @@ public class FlowUiController {
     public String trigger(@PathVariable("id") String id,
                           @RequestParam(name = "payload", required = false) String payload,
                           @RequestParam(name = "dedupKey", required = false) String dedupKey,
+                          Principal principal,
                           RedirectAttributes redirect) {
         JsonNode payloadNode;
         try {
@@ -112,6 +120,10 @@ public class FlowUiController {
         }
         try {
             UUID executionId = router.routeManual(id, payloadNode, TriggerController.normalisedDedupKey(dedupKey));
+            // Same ledger entry the REST trigger writes, so a console-started run is
+            // attributed to the person who clicked, not just to 'system'.
+            auditLog.record(executionId, AuditEventType.TRIGGER_RECEIVED, null, CurrentUser.name(principal),
+                    Map.of("flowId", id, "trigger", "console"));
             redirect.addFlashAttribute("message", "Execution started");
             return "redirect:/executions/" + executionId;
         } catch (FlowValidationException | IllegalArgumentException | DailyBudgetExceededException e) {

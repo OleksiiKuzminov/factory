@@ -1,5 +1,6 @@
 package org.folio.factory.app.web;
 
+import org.folio.factory.app.security.CurrentUser;
 import org.folio.factory.core.domain.HitlReview;
 import org.folio.factory.core.domain.HitlReviewStatus;
 import org.folio.factory.core.hitl.HitlDecision;
@@ -22,6 +23,7 @@ import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.security.Principal;
 import java.util.List;
 import java.util.Optional;
 import java.util.UUID;
@@ -42,6 +44,7 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
 class HitlReviewControllerTest {
 
     private static final UUID EXECUTION_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    private static final Principal QA_LEAD = () -> "qa-lead";
 
     private final JsonMapper json = JsonMapper.builder().build();
 
@@ -132,7 +135,7 @@ class HitlReviewControllerTest {
     void decide_missingDecision_unprocessableWithoutDelegation() throws Exception {
         mvc.perform(post("/api/hitl/reviews/{id}/decision", EXECUTION_ID)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"reviewer\":\"qa\"}"))
+                        .content("{}"))
                 .andExpect(status().is(422))
                 .andExpect(jsonPath("$.error").value(containsString("decision is required")));
 
@@ -142,12 +145,13 @@ class HitlReviewControllerTest {
     @Test
     void decide_alreadyDecided_conflict() throws Exception {
         UUID id = UUID.fromString("00000000-0000-0000-0000-0000000000aa");
-        when(decisionService.decide(id, HitlDecision.APPROVE, "qa", null, null))
+        when(decisionService.decide(id, HitlDecision.APPROVE, "qa-lead", null, null))
                 .thenThrow(new IllegalStateException("Review " + id + " has already been decided (APPROVED)"));
 
         mvc.perform(post("/api/hitl/reviews/{id}/decision", id)
+                        .principal(QA_LEAD)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"decision\":\"APPROVE\",\"reviewer\":\"qa\"}"))
+                        .content("{\"decision\":\"APPROVE\"}"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value(containsString("already been decided")));
     }
@@ -155,12 +159,13 @@ class HitlReviewControllerTest {
     @Test
     void decide_concurrentDecision_conflict() throws Exception {
         UUID id = UUID.fromString("00000000-0000-0000-0000-0000000000bb");
-        when(decisionService.decide(id, HitlDecision.APPROVE, "qa", null, null))
+        when(decisionService.decide(id, HitlDecision.APPROVE, "qa-lead", null, null))
                 .thenThrow(new OptimisticLockingFailureException("row was updated by another transaction"));
 
         mvc.perform(post("/api/hitl/reviews/{id}/decision", id)
+                        .principal(QA_LEAD)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"decision\":\"APPROVE\",\"reviewer\":\"qa\"}"))
+                        .content("{\"decision\":\"APPROVE\"}"))
                 .andExpect(status().isConflict())
                 .andExpect(jsonPath("$.error").value(containsString("another transaction")));
     }
@@ -168,20 +173,48 @@ class HitlReviewControllerTest {
     @Test
     void decide_happyPath_delegatesAndReturnsDetail() throws Exception {
         HitlReview review = pendingReview();
-        review.decide(HitlReviewStatus.APPROVED, "APPROVE", "qa", "looks good", null);
+        review.decide(HitlReviewStatus.APPROVED, "APPROVE", "qa-lead", "looks good", null);
         when(reviews.findById(review.getId())).thenReturn(Optional.of(review));
 
         mvc.perform(post("/api/hitl/reviews/{id}/decision", review.getId())
+                        .principal(QA_LEAD)
                         .contentType(MediaType.APPLICATION_JSON)
-                        .content("{\"decision\":\"APPROVE\",\"reviewer\":\"qa\",\"comments\":\"looks good\"}"))
+                        .content("{\"decision\":\"APPROVE\",\"comments\":\"looks good\"}"))
                 .andExpect(status().isOk())
                 .andExpect(jsonPath("$.id").value(review.getId().toString()))
                 .andExpect(jsonPath("$.status").value("APPROVED"))
                 .andExpect(jsonPath("$.decision").value("APPROVE"))
-                .andExpect(jsonPath("$.reviewer").value("qa"))
+                .andExpect(jsonPath("$.reviewer").value("qa-lead"))
                 .andExpect(jsonPath("$.comments").value("looks good"))
                 .andExpect(jsonPath("$.reviewPackage.title").value("Review test plan"));
 
-        verify(decisionService).decide(review.getId(), HitlDecision.APPROVE, "qa", "looks good", null);
+        verify(decisionService).decide(review.getId(), HitlDecision.APPROVE, "qa-lead", "looks good", null);
+    }
+
+    @Test
+    void decide_reviewerFieldInBody_ignoredInFavourOfAuthenticatedPrincipal() throws Exception {
+        HitlReview review = pendingReview();
+        when(reviews.findById(review.getId())).thenReturn(Optional.of(review));
+
+        mvc.perform(post("/api/hitl/reviews/{id}/decision", review.getId())
+                        .principal(QA_LEAD)
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"decision\":\"APPROVE\",\"reviewer\":\"someone-else\"}"))
+                .andExpect(status().isOk());
+
+        verify(decisionService).decide(review.getId(), HitlDecision.APPROVE, "qa-lead", null, null);
+    }
+
+    @Test
+    void decide_withoutPrincipal_recordsAnonymousRatherThanAnyClientSuppliedName() throws Exception {
+        HitlReview review = pendingReview();
+        when(reviews.findById(review.getId())).thenReturn(Optional.of(review));
+
+        mvc.perform(post("/api/hitl/reviews/{id}/decision", review.getId())
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"decision\":\"APPROVE\",\"reviewer\":\"someone-else\"}"))
+                .andExpect(status().isOk());
+
+        verify(decisionService).decide(review.getId(), HitlDecision.APPROVE, CurrentUser.ANONYMOUS, null, null);
     }
 }

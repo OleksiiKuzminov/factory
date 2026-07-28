@@ -606,3 +606,29 @@ tbody tr:hover { background: hsl(var(--muted) / 0.4); }
   .sidebar-footer { margin-top: 0; margin-left: auto; }
   .main { padding: 1.25rem; }
 }
+
+/* ---------- session controls ---------- */
+.session-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.25rem 0.5rem;
+  margin-bottom: 0.5rem;
+}
+.session-user {
+  font-size: 0.8125rem;
+  color: hsl(var(--muted-foreground));
+  overflow-wrap: anywhere;
+}
+
+/* ---------- login page ---------- */
+.login-shell {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 1.5rem;
+}
+.login-card { width: min(24rem, 100%); }
+.login-card .card-title { font-size: 1.25rem; }

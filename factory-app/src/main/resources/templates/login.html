@@ -1,0 +1,50 @@
+<!DOCTYPE html>
+<html xmlns:th="http://www.thymeleaf.org" lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Sign in — AI Factory</title>
+    <script>
+        (function () {
+            var t = localStorage.getItem('theme');
+            if (t === 'dark' || (!t && matchMedia('(prefers-color-scheme: dark)').matches))
+                document.documentElement.dataset.theme = 'dark';
+        })();
+    </script>
+    <link rel="stylesheet" th:href="@{/css/tokens.css}">
+    <link rel="stylesheet" th:href="@{/css/app.css}">
+</head>
+<body>
+<main class="login-shell">
+    <div class="card login-card">
+        <div class="card-header">
+            <h1 class="card-title">AI Factory</h1>
+            <p class="card-description">Sign in to review and approve pipeline gates.</p>
+        </div>
+        <div class="card-content">
+            <div class="alert alert-error" role="alert" th:if="${loginFailed}">
+                Invalid username or password.
+            </div>
+            <div class="alert alert-success" role="status" th:if="${loggedOut}">
+                You have been signed out.
+            </div>
+            <form method="post" th:action="@{/login}">
+                <div class="field">
+                    <label class="label" for="username">Username</label>
+                    <input class="input" type="text" id="username" name="username"
+                           autocomplete="username" required autofocus>
+                </div>
+                <div class="field">
+                    <label class="label" for="password">Password</label>
+                    <input class="input" type="password" id="password" name="password"
+                           autocomplete="current-password" required>
+                </div>
+                <div class="field">
+                    <button class="btn btn-primary" type="submit">Sign in</button>
+                </div>
+            </form>
+        </div>
+    </div>
+</main>
+</body>
+</html>

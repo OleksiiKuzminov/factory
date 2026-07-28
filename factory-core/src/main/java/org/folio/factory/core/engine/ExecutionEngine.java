@@ -54,6 +54,7 @@ public class ExecutionEngine {
     private final AuditLog auditLog;
     private final HitlGateOpener hitlGateOpener;
     private final SubFlowInvoker subFlowInvoker;
+    private final StepLeaseHeartbeat stepLeaseHeartbeat;
     private final List<StepPostProcessor> postProcessors;
     private final JsonMapper jsonMapper;
     private final EngineMetrics engineMetrics;
@@ -65,6 +66,7 @@ public class ExecutionEngine {
                            AuditLog auditLog,
                            HitlGateOpener hitlGateOpener,
                            SubFlowInvoker subFlowInvoker,
+                           StepLeaseHeartbeat stepLeaseHeartbeat,
                            List<StepPostProcessor> postProcessors,
                            JsonMapper jsonMapper,
                            EngineMetrics engineMetrics) {
@@ -75,6 +77,7 @@ public class ExecutionEngine {
         this.auditLog = auditLog;
         this.hitlGateOpener = hitlGateOpener;
         this.subFlowInvoker = subFlowInvoker;
+        this.stepLeaseHeartbeat = stepLeaseHeartbeat;
         this.postProcessors = postProcessors;
         this.jsonMapper = jsonMapper;
         this.engineMetrics = engineMetrics;
@@ -140,7 +143,13 @@ public class ExecutionEngine {
             try {
                 AgentWorker worker = workerRegistry.require(step.workerId());
                 AgentContext context = buildContext(execution, step);
-                AgentResult result = worker.execute(context);
+                AgentResult result;
+                // The lease must stay fresh for the whole worker call, not just at step
+                // entry: a reaped step is driven again concurrently, and the guarded
+                // advance below protects the cursor but not the worker's side effects.
+                try (AutoCloseable lease = stepLeaseHeartbeat.start(executionId)) {
+                    result = worker.execute(context);
+                }
                 requireDeclaredOutputs(step, result);
                 for (StepPostProcessor postProcessor : postProcessors) {
                     postProcessor.process(flow, step, result.outputs());

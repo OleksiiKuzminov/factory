@@ -45,6 +45,23 @@ agent_chain:
     config:
       framework: karate
 
+  - step_id: script-review
+    type: HITL_GATE
+    gate:
+      gate_id: gate-script-review
+      title: "Security review: generated scripts before execution"
+      review_instructions: >
+        Approving this gate EXECUTES these generated scripts against the
+        reference environment. Karate features are code, not data — they run
+        JavaScript with Java.type() interop, so a feature can reach any host,
+        file or process the runner can. Their content derives from the source
+        issue, which is attacker-influenceable. Read every file: confirm each
+        scenario implements an approved test case, targets only the configured
+        base URL, and contains no read/write of local files, no process or
+        Java.type() calls and no credentials. AMEND or REJECT anything you
+        would not run yourself.
+      reviewed_artifacts: [test_scripts.md, test_plan.md]
+
   - step_id: test-execution
     type: AGENT
     worker_id: test-execution-agent

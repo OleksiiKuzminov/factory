@@ -105,6 +105,19 @@ class AuditControllerTest {
     }
 
     @Test
+    void list_connectorFailedEventType_isAKnownFilterValue() throws Exception {
+        AuditEvent event = event(11L, AuditEventType.CONNECTOR_FAILED,
+                "{\"connector\":\"testrail\",\"detail\":\"500 from TestRail\"}");
+        when(audit.findByEventTypeOrderByIdDesc(eq(AuditEventType.CONNECTOR_FAILED), any(Pageable.class)))
+                .thenReturn(new PageImpl<>(List.of(event), PageRequest.of(0, 50), 1));
+
+        mvc.perform(get("/api/audit").param("eventType", "CONNECTOR_FAILED"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$.items[0].eventType").value("CONNECTOR_FAILED"))
+                .andExpect(jsonPath("$.items[0].detail.connector").value("testrail"));
+    }
+
+    @Test
     void list_badEventType_unprocessableWithoutRepositoryAccess() throws Exception {
         mvc.perform(get("/api/audit").param("eventType", "NOPE"))
                 .andExpect(status().is(422))

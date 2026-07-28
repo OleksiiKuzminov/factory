@@ -1,5 +1,6 @@
 package org.folio.factory.app.web;
 
+import org.folio.factory.app.security.CurrentUser;
 import org.folio.factory.core.domain.HitlReview;
 import org.folio.factory.core.domain.HitlReviewStatus;
 import org.folio.factory.core.hitl.HitlDecision;
@@ -17,6 +18,7 @@ import org.springframework.web.bind.annotation.RestController;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.security.Principal;
 import java.time.Instant;
 import java.util.Map;
 import java.util.NoSuchElementException;
@@ -46,7 +48,11 @@ public class HitlReviewController {
                                Instant createdAt, Instant decidedAt) {
     }
 
-    public record DecisionRequest(HitlDecision decision, String reviewer, String comments,
+    /**
+     * No reviewer field by design: the identity recorded in the ledger comes from the
+     * authenticated principal, so a client cannot decide a gate under someone else's name.
+     */
+    public record DecisionRequest(HitlDecision decision, String comments,
                                   Map<String, String> amendedArtifacts) {
     }
 
@@ -75,11 +81,12 @@ public class HitlReviewController {
     }
 
     @PostMapping("/{id}/decision")
-    public ReviewDetail decide(@PathVariable("id") UUID id, @RequestBody DecisionRequest request) {
+    public ReviewDetail decide(@PathVariable("id") UUID id, @RequestBody DecisionRequest request,
+                               Principal principal) {
         if (request.decision() == null) {
             throw new IllegalArgumentException("decision is required (APPROVE, AMEND or REJECT)");
         }
-        decisionService.decide(id, request.decision(), request.reviewer(), request.comments(),
+        decisionService.decide(id, request.decision(), CurrentUser.name(principal), request.comments(),
                 request.amendedArtifacts());
         return get(id);
     }

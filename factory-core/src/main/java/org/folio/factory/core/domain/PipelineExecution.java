@@ -40,6 +40,9 @@ public class PipelineExecution {
     @Column(name = "parent_step_index")
     private Integer parentStepIndex;
 
+    @Column(name = "awaiting_child_execution_id")
+    private UUID awaitingChildExecutionId;
+
     @JdbcTypeCode(SqlTypes.JSON)
     @Column(name = "trigger_payload")
     private String triggerPayload;
@@ -135,6 +138,19 @@ public class PipelineExecution {
 
     public void setParentStepIndex(Integer parentStepIndex) {
         this.parentStepIndex = parentStepIndex;
+    }
+
+    /**
+     * The sub-flow child this execution is parked on, when it is AWAITING_SUBFLOW.
+     * Overwritten by every child creation, so recovery sweeps can tell the live
+     * invocation from one a re-invocation superseded without comparing clocks.
+     */
+    public UUID getAwaitingChildExecutionId() {
+        return awaitingChildExecutionId;
+    }
+
+    public void setAwaitingChildExecutionId(UUID awaitingChildExecutionId) {
+        this.awaitingChildExecutionId = awaitingChildExecutionId;
     }
 
     public String getTriggerPayload() {

@@ -7,8 +7,15 @@ artifacts**, and every consequential step passes a **human-in-the-loop gate**.
 
 Milestone 1 ships the shared orchestration framework plus **the Test Factory
 flow**: Jira story → scope manifest → manual test plan → QA review →
-generated Karate scripts → (advisory or real) execution → QA sign-off →
-TestRail / GitHub / Jira sync.
+generated Karate scripts → **script review gate** → (advisory or real)
+execution → QA sign-off → TestRail / GitHub / Jira sync. Eight steps, **three**
+HITL gates.
+
+The middle gate is a security boundary, not a quality one: approving it
+*executes* the generated scripts. Karate features are code — they run JavaScript
+with `Java.type()` interop, so a feature can reach any host, file or process the
+runner can, and their content derives from an attacker-influenceable source
+issue. Nothing generated runs before a human has read every file.
 
 ## Documentation
 
@@ -74,16 +81,23 @@ mvn install -DskipTests
 # 4. Run
 mvn spring-boot:run -pl factory-app
 
-# 5. Trigger the Test Factory flow with the bundled sample story (no Jira needed — issue inline)
-curl -s -X POST localhost:8080/api/triggers/manual \
+# 5. Trigger the Test Factory flow with the bundled sample story (no Jira needed — issue inline).
+#    /api/** requires authentication: with FACTORY_AUTH_USERS unset, the startup log
+#    prints a generated password for 'admin' ("Using generated security password…").
+curl -sf -u admin:"$ADMIN_PASSWORD" -X POST localhost:8080/api/triggers/manual \
   -H 'Content-Type: application/json' \
   -d @factory-app/src/main/resources/samples/sample-story-inline.json
 ```
 
-Then open the management UI at <http://localhost:8080/> — a dashboard with KPI
-cards and charts. The run deliberately **pauses at the first QA gate**
-(`AWAITING_HITL`) and does not proceed until you act on it: work the two QA
-gates at <http://localhost:8080/reviews>
+Set your own accounts instead of copying the generated password each restart:
+`export FACTORY_AUTH_USERS=me:letmein` before step 4. See
+[Configuration](#configuration) below.
+
+Then open the management UI at <http://localhost:8080/> and sign in at `/login`
+with the same credentials — a dashboard with KPI cards and charts. The run
+deliberately **pauses at the first QA gate** (`AWAITING_HITL`) and does not
+proceed until you act on it: work the three review gates (test plan, script
+security review, sign-off) at <http://localhost:8080/reviews>
 (approve/amend/reject — edits are saved as new artifact versions) and watch
 progress at <http://localhost:8080/executions> (full audit timeline per
 execution). The rest of the console: `/flows`
@@ -146,6 +160,9 @@ Metrics are exposed at `/actuator/prometheus`; Kubernetes probes at
 
 | Environment variable | Purpose |
 |---|---|
+| `FACTORY_AUTH_ENABLED` | Console + REST authentication (default `true`; `false` only behind an authenticating proxy) |
+| `FACTORY_AUTH_USERS` | Comma-separated `user:password` pairs; a password may be pre-encoded as `{bcrypt}$2a$…` (required if it contains a `,` — the entry separator). Unset generates a random password for `admin` and logs it |
+| `FACTORY_AUTH_METRICS_PUBLIC` | Let unauthenticated scrapers read `/actuator/prometheus` and `/actuator/metrics` (default `false`; health probes are always public) |
 | `ANTHROPIC_API_KEY` | LLM provider key (Spring AI Anthropic starter) |
 | `FACTORY_LLM_MODEL` | Chat model id (default `claude-sonnet-4-5`, or `llama-3.3-70b-versatile` with the `openai` provider) |
 | `FACTORY_LLM_PROVIDER` | `anthropic` (default) or `openai` for any OpenAI-compatible endpoint (Groq, Gemini, OpenRouter, local Ollama) |
@@ -155,6 +172,7 @@ Metrics are exposed at `/actuator/prometheus`; Kubernetes probes at
 | `FACTORY_DB_POOL_MAX` / `_MIN_IDLE` | HikariCP pool sizing (defaults `16` / `4`; see `doc/performance.md`) |
 | `FACTORY_DB_POOL_CONNECTION_TIMEOUT_MS` / `_MAX_LIFETIME_MS` / `_IDLE_TIMEOUT_MS` / `_LEAK_DETECTION_MS` | HikariCP tuning (defaults `30000` / `1800000` / `600000` / `60000`) |
 | `FACTORY_HTTP_CONNECT_TIMEOUT` / `_READ_TIMEOUT` | Connector HTTP timeouts (Duration; defaults `5s` / `30s`) |
+| `FACTORY_LLM_READ_TIMEOUT` | Bound on one model call (Duration; default `120s`). Must exceed the slowest legitimate completion |
 | `FACTORY_CONNECTORS_JIRA_BASE_URL` / `_EMAIL` / `_API_TOKEN` | Jira REST v2 |
 | `FACTORY_CONNECTORS_GITHUB_TOKEN` (+ `_BASE_URL` for GHE) | GitHub REST |
 | `FACTORY_CONNECTORS_TESTRAIL_BASE_URL` / `_USERNAME` / `_API_KEY` / `_PROJECT_ID` | TestRail API v2 |
@@ -174,12 +192,25 @@ Metrics are exposed at `/actuator/prometheus`; Kubernetes probes at
 | `FACTORY_RETENTION_BATCH_SIZE` | Executions purged per retention run (default `100`) |
 | `FACTORY_TEST_FACTORY_BASE_BRANCH` | Branch generated test PRs fork from (default `main`) |
 | `FACTORY_WEBHOOKS_SHARED_SECRET` | Webhook auth token (see below; unauthenticated while unset) |
+| `FACTORY_WEBHOOKS_GITHUB_SECRET` | GitHub HMAC secret; when set, `/api/webhooks/github` also requires a valid `X-Hub-Signature-256` |
+| `FACTORY_DASHBOARD_STATS_CACHE_TTL` | Dashboard aggregate snapshot TTL, one snapshot per offered window (Duration; default `30s`, `0s` disables) |
+| `FACTORY_ENGINE_HEARTBEAT_INTERVAL_SECONDS` / `_MAX_STEP_HEARTBEAT_SECONDS` | Step lease refresh cadence / ceiling (defaults `60` / `3600`). A running step refreshes its own lease, so the **ceiling** — not the lease timeout — is the knob to raise for legitimately long steps |
 | `FACTORY_SHUTDOWN_PHASE_TIMEOUT` | Per-phase graceful-shutdown budget (Duration; default `60s`) |
 
-Webhooks: `POST /api/webhooks/jira` and `/api/webhooks/github`
-(shared secret: `FACTORY_WEBHOOKS_SHARED_SECRET` checked against `?token=`).
-**Webhooks are unauthenticated while the secret is unset** — the app logs a
-warning at startup; always set it in non-local deployments.
+Authentication is **on by default**: the console uses a form login at `/login`
+and the REST API HTTP Basic, and every HITL decision is attributed to the
+authenticated principal — never to a name in the request. With
+`FACTORY_AUTH_USERS` unset a random password is generated for `admin` and logged
+at startup.
+
+Webhooks are exempt (they carry their own credentials): `POST
+/api/webhooks/jira` and `/api/webhooks/github` check
+`FACTORY_WEBHOOKS_SHARED_SECRET` against the `X-Factory-Webhook-Token` header
+(the legacy `?token=` query parameter still works but leaks into access logs and
+logs a deprecation warning). Setting `FACTORY_WEBHOOKS_GITHUB_SECRET`
+additionally requires a valid `X-Hub-Signature-256` HMAC over the raw GitHub
+body. **Webhooks are unauthenticated while the shared secret is unset** — the app
+logs a warning at startup; always set it in non-local deployments.
 
 ## Adding a new flow (the plugin pattern)
 
@@ -209,7 +240,7 @@ mvn verify        # unit + integration tests (Testcontainers PostgreSQL; Docker 
 ```
 
 The suite includes two full Test Factory end-to-end tests (scripted LLM, WireMock'd
-Jira/GitHub/TestRail): the happy path with a QA amendment at gate 1, and the
-zero-credentials path. Engine semantics (retry → escalation, poller crash
+Jira/GitHub/TestRail): the happy path — authenticated over HTTP Basic, with a QA
+amendment at gate 1 — and the zero-credentials path. Engine semantics (retry → escalation, poller crash
 recovery, sub-flow parent/child, HITL decisions) are covered in
 `factory-core`'s integration tests.

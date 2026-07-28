@@ -23,6 +23,7 @@ Concurrent borrowers at peak:
 |---|---|---|
 | Engine step executors | `factory.engine.worker-threads` (default **4**) | `factoryEngineExecutor` core=max=worker-threads; each thread does serial short txs |
 | Poller / reaper scheduler | **1-2** | `@EnableScheduling` default `TaskScheduler` is single-threaded; `poll()` (claim) and `maintain()` (reap + sub-flow reconcile) never run concurrently with themselves |
+| Step-lease heartbeat | **1** | `StepLeaseHeartbeat` runs one daemon thread for all in-flight steps; each refresh is a single short `UPDATE` on `pipeline_execution`, every `heartbeat-interval-seconds` per running step |
 | HITL UI / REST / webhook request threads | burst **~8** | `open-in-view: false`, so a connection is held only during repository calls, not the whole request |
 | Flyway | **1-2** | Startup only, from this same pool, before traffic and before the poller does meaningful work -- overlaps nothing |
 
@@ -32,6 +33,9 @@ Concurrent borrowers at peak:
 maximum-pool-size = worker-threads(4) + scheduler(2) + web headroom(8) + flyway/misc(2) = 16
 minimum-idle      = 4   (== worker-threads: keep the engine's steady-state baseline warm)
 ```
+
+The heartbeat thread borrows from the `flyway/misc` slice — it is one thread, and
+Flyway has finished long before any step runs.
 
 All values are env-overridable (see the table below). `16` gives the 4 engine
 threads their own connections with room for the scheduler, a burst of operators
@@ -94,15 +98,28 @@ sits in front, keep `max-lifetime` under its `server_idle_timeout`.
 Goal: drive **N** concurrent executions through the poller and confirm the pool
 is not the bottleneck (and find the point at which the *poller* is).
 
-### Setup: lift the cost limits first
+### Setup: authentication and the cost limits
 
-The defaults this branch ships are sized for production spend control, not load
-testing, and will distort or halt the test:
+`/api/**` requires authentication, so **an unauthenticated driver measures
+nothing**: every POST returns 401 without creating an execution, and a `curl`
+that only discards its output cannot tell that apart from a successful ingest.
+Either drive the load with credentials (`-u user:password`, plus `-f` so a 4xx is
+a non-zero exit) or run the app with `FACTORY_AUTH_ENABLED=false` — acceptable
+for a throwaway local load test, never for a shared instance. Reading the metrics
+below is also authenticated unless `FACTORY_AUTH_METRICS_PUBLIC=true`.
+
+The cost-control defaults this branch ships are sized for production spend
+control, not load testing, and will distort or halt the test:
 
 - `FACTORY_LIMITS_MAX_EXECUTIONS_PER_DAY=0` (or above the total trigger count) —
-  the default budget of 200 is exhausted after ~80 s of ingest at the 2.5/s claim
-  rate, after which every manual trigger returns **429** (manual triggers carry no
-  dedup key, so every POST counts).
+  the budget is consumed at **trigger creation**, not at claim time:
+  `PipelineRouter.enforceDailyBudget` runs on the POST path and counts executions
+  *created* since 00:00 UTC, so the 2.5/s claim rate above does not pace it at all.
+  The driver below creates rows as fast as the web tier accepts them, so the
+  default 200 is gone in seconds and every further manual trigger returns **429** —
+  which reads like a pool or poller failure and is not one. Manual triggers carry
+  no dedup key, so every POST counts, and the count is over `pipeline_execution`
+  rows: restarting the app does not give the run a fresh budget.
 - Raise `FACTORY_LIMITS_MAX_CONCURRENT_EXECUTIONS` (or set `0` to disable) —
   otherwise in-flight executions plateau at 8 and the poller/pool ceiling you are
   trying to measure is never reached. Measurement 4 below (engine-executor queue
@@ -117,10 +134,17 @@ execution:
 # Fire N concurrent triggers (N=50 shown). Zero connector credentials => advisory
 # mode: every external sync is audited CONNECTOR_SKIPPED, so nothing blocks on Jira/
 # GitHub/TestRail and the run exercises only the engine + DB.
-seq 50 | xargs -P 50 -I{} curl -s -o /dev/null -X POST localhost:8080/api/triggers/manual \
+# -f + %{http_code}: a 401 or a 429 must be visible, not silently counted as ingest.
+seq 50 | xargs -P 50 -I{} curl -sf -u "$API_USER:$API_PASSWORD" \
+  -o /dev/null -w '%{http_code}\n' -X POST localhost:8080/api/triggers/manual \
   -H 'Content-Type: application/json' \
-  -d @factory-app/src/main/resources/samples/sample-story-inline.json
+  -d @factory-app/src/main/resources/samples/sample-story-inline.json \
+  | sort | uniq -c
 ```
+
+Expect `50` × `202`. Anything else — `401` (credentials), `429` (daily budget),
+`422` (payload) — means the executions you are about to measure were never
+created.
 
 The LLM call still needs `ANTHROPIC_API_KEY` and its latency will dominate wall
 time. To load-test the **engine + DB** in isolation (no tokens, no network
@@ -132,7 +156,8 @@ pool/poller are the only contended resources.
 
 Expose metrics for the run (OBS-1 wires this permanently; for an ad-hoc test add
 `metrics` to `management.endpoints.web.exposure.include`) and read
-`GET /actuator/metrics/<name>`:
+`GET /actuator/metrics/<name>` — with `-u` credentials, or set
+`FACTORY_AUTH_METRICS_PUBLIC=true` for the duration of the test:
 
 1. **Claim latency / throughput** -- time from execution row created (`PENDING`)
    to `RUNNING`. Expect a staircase bounded by `batch-size`/`poll-interval`

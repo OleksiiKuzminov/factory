@@ -27,10 +27,24 @@ public class ScriptBundleCodec {
             "^## file: (.+?)\\s*\\n+" + FENCE + "[a-z]*\\n(.*?)\\n" + FENCE,
             Pattern.MULTILINE | Pattern.DOTALL);
 
+    /**
+     * Every path segment must start with an alphanumeric or underscore, which leaves no
+     * room for a {@code ..} traversal, an absolute path, a Windows separator or a leading
+     * {@code -}. Bundle paths are written to disk and passed as argv elements of the
+     * Karate CLI, so anything that could escape the work directory or read as an option
+     * is rejected outright rather than sanitised.
+     */
+    private static final Pattern SAFE_PATH =
+            Pattern.compile("[A-Za-z0-9_][A-Za-z0-9._-]*(/[A-Za-z0-9_][A-Za-z0-9._-]*)*");
+
     private final FrontmatterCodec frontmatterCodec;
 
     public ScriptBundleCodec(FrontmatterCodec frontmatterCodec) {
         this.frontmatterCodec = frontmatterCodec;
+    }
+
+    public static boolean isSafePath(String path) {
+        return path != null && SAFE_PATH.matcher(path).matches();
     }
 
     public String render(ScriptBundle bundle) {

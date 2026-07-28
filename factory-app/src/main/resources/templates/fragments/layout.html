@@ -51,6 +51,15 @@
                th:attrappend="aria-current=${activeNav == 'prompts'} ? 'page'">Prompts</a>
         </nav>
         <div class="sidebar-footer">
+            <div class="session-bar" th:if="${currentUser}">
+                <p class="session-user">
+                    <span class="sr-only">Signed in as </span>
+                    <span th:text="${currentUser}">user</span>
+                </p>
+                <form method="post" th:action="@{/logout}">
+                    <button type="submit" class="btn btn-ghost btn-sm">Sign out</button>
+                </form>
+            </div>
             <button type="button" id="theme-toggle" class="btn btn-ghost btn-sm" aria-pressed="false">
                 <span aria-hidden="true">☾</span>
                 <span data-theme-label>Dark</span>

@@ -39,6 +39,9 @@ curl -s -X POST localhost:8080/api/triggers/manual \
   -d @factory-app/src/main/resources/samples/sample-story-inline.json
 ```
 
+The API call above needs credentials unless `FACTORY_AUTH_ENABLED=false`; with
+`FACTORY_AUTH_USERS` unset the app logs a generated `admin` password at startup.
+
 Then work the QA gates at `http://localhost:8080/reviews`, watch progress at
 `/executions`, check connectors at `/api/status`. The rest of the console:
 `/` (dashboard), `/flows`, `/artifacts`, `/workers`, `/prompts`, `/audit`,
@@ -124,9 +127,10 @@ response with `FrontmatterCodec` (YAML frontmatter + markdown body), and runs
 post-processors (e.g. `SecretScanPostProcessor`; the Test Factory flow adds
 `KarateSanityPostProcessor`). Test Factory's five workers live in
 `factory-flow-test-factory/.../worker/`; its chain is
-`flows/test-factory.yaml`: triage → test-spec → HITL gate 1 → test-automation
-(Karate) → test-execution → HITL gate 2 → finalizer (TestRail/GitHub/Jira
-sync).
+`flows/test-factory.yaml`: triage → test-spec → HITL gate 1 (test plan) →
+test-automation (Karate) → HITL gate 2 (script review — nothing executes
+generated code before a human sees it) → test-execution → HITL gate 3 (sign-off)
+→ finalizer (TestRail/GitHub/Jira sync).
 
 ### Management console (factory-app web UI)
 
@@ -171,8 +175,21 @@ No engine, router, or gateway changes — if a change seems to require touching
 - Kebab-case properties there use **explicit `${ENV_VAR:}` placeholders**
   because relaxed binding alone would not map the underscored env vars; follow
   that pattern when adding properties.
-- Webhooks (`/api/webhooks/jira`, `/api/webhooks/github`) are unauthenticated
-  until `FACTORY_WEBHOOKS_SHARED_SECRET` is set (checked against `?token=`).
+- Console and REST API authentication is **on by default**
+  (`FACTORY_AUTH_ENABLED`, `FACTORY_AUTH_USERS` as `user:password` pairs). The
+  console uses a form login at `/login`; `/api/**` uses HTTP Basic. The HITL
+  reviewer and the trigger actor come from the authenticated principal, never
+  from the request body — `SecurityConfiguration` in `app/security/`.
+- Webhooks are exempt from that chain and are unauthenticated until
+  `FACTORY_WEBHOOKS_SHARED_SECRET` is set (checked against the
+  `X-Factory-Webhook-Token` header; the legacy `?token=` query parameter still
+  works and logs a deprecation warning). `FACTORY_WEBHOOKS_GITHUB_SECRET`
+  additionally enforces GitHub's `X-Hub-Signature-256` HMAC over the raw body.
+- The LLM transport is **not** covered by `spring.http.clients`: Spring AI 2.0
+  gives each chat model its own OkHttp client and rebuilds it per request from
+  `spring.ai.<provider>.timeout`, which `application.yaml` derives from
+  `factory.llm.read-timeout`. An `*HttpClientBuilderCustomizer` bean cannot set
+  timeouts — the per-request rebuild overwrites them.
 
 ## Testing conventions
 
@@ -182,12 +199,20 @@ No engine, router, or gateway changes — if a change seems to require touching
   `factory-core/src/test/resources/flows/`.
 - Full Test Factory end-to-end lives in `factory-app` (`TestFactoryEndToEndTest`,
   `TestFactoryZeroCredentialsTest`): scripted LLM, WireMock'd Jira/GitHub/TestRail,
-  including a QA amendment at gate 1 and the zero-credentials path. When
-  changing flow behavior, extend these rather than mocking the engine.
+  including a QA amendment at gate 1 and the zero-credentials path. The
+  end-to-end test runs with authentication on and drives the REST API over HTTP
+  Basic. When changing flow behavior, extend these rather than mocking the engine.
 - UI pages get two tiers: standalone MockMvc controller tests (dispatch and
   model shape) and `UiRenderSmokeTest` — the only tier that resolves the
   layout/component fragments. Anything content-bearing must assert real page
-  text there; standalone tests cannot catch fragment-scope bugs.
+  text there; standalone tests cannot catch fragment-scope bugs. It signs in
+  with HTTP Basic; the security chains themselves live in
+  `app/security/*SecurityTest` — one Spring context per `factory.auth.*` shape:
+  `ConsoleAndApiSecurityTest` (the default chain, accounts configured),
+  `AuthDisabledSecurityTest`, `GeneratedAdminSecurityTest` (no accounts
+  configured), `MetricsPublicSecurityTest`. An auth property that rewires the
+  chain needs its own context — `@SpringBootTest(properties = …)` is per-class,
+  so it cannot be another case in an existing one.
 
 ## Communication
 - Short, direct, content-dense — no padding, praise, or narrative summaries.

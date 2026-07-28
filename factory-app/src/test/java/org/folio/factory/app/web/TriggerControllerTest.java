@@ -1,6 +1,9 @@
 package org.folio.factory.app.web;
 
+import org.folio.factory.app.security.CurrentUser;
+import org.folio.factory.core.domain.AuditEventType;
 import org.folio.factory.core.limits.DailyBudgetExceededException;
+import org.folio.factory.core.service.AuditLog;
 import org.folio.factory.core.trigger.PipelineRouter;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
@@ -13,12 +16,14 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.util.Map;
 import java.util.UUID;
 
 import static org.hamcrest.Matchers.containsString;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.ArgumentMatchers.isNull;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.post;
@@ -36,11 +41,14 @@ class TriggerControllerTest {
     @Mock
     private PipelineRouter router;
 
+    @Mock
+    private AuditLog auditLog;
+
     private MockMvc mvc;
 
     @BeforeEach
     void setUp() {
-        mvc = MockMvcBuilders.standaloneSetup(new TriggerController(router))
+        mvc = MockMvcBuilders.standaloneSetup(new TriggerController(router, auditLog))
                 .setControllerAdvice(new ApiExceptionHandler())
                 .build();
     }
@@ -53,7 +61,7 @@ class TriggerControllerTest {
                 .andExpect(status().isBadRequest())
                 .andExpect(jsonPath("$.error").value("Malformed request body"));
 
-        verifyNoInteractions(router);
+        verifyNoInteractions(router, auditLog);
     }
 
     @Test
@@ -64,7 +72,7 @@ class TriggerControllerTest {
                 .andExpect(status().isUnsupportedMediaType())
                 .andExpect(jsonPath("$.error").value(containsString("text/plain")));
 
-        verifyNoInteractions(router);
+        verifyNoInteractions(router, auditLog);
     }
 
     @Test
@@ -77,7 +85,7 @@ class TriggerControllerTest {
                 .andExpect(status().is(422))
                 .andExpect(jsonPath("$.error").value(containsString("dedupKey")));
 
-        verifyNoInteractions(router);
+        verifyNoInteractions(router, auditLog);
     }
 
     @Test
@@ -117,6 +125,33 @@ class TriggerControllerTest {
     }
 
     @Test
+    void manual_authenticatedCaller_auditedAsTheTriggerActor() throws Exception {
+        when(router.routeManual(eq(FLOW_ID), any(), isNull())).thenReturn(EXECUTION_ID);
+
+        mvc.perform(post("/api/triggers/manual")
+                        .principal(() -> "rel-mgr")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"flowId\":\"" + FLOW_ID + "\",\"payload\":{}}"))
+                .andExpect(status().isAccepted());
+
+        verify(auditLog).record(EXECUTION_ID, AuditEventType.TRIGGER_RECEIVED, null, "rel-mgr",
+                Map.of("flowId", FLOW_ID, "trigger", "manual"));
+    }
+
+    @Test
+    void manual_withoutPrincipal_auditedAsAnonymous() throws Exception {
+        when(router.routeManual(eq(FLOW_ID), any(), isNull())).thenReturn(EXECUTION_ID);
+
+        mvc.perform(post("/api/triggers/manual")
+                        .contentType(MediaType.APPLICATION_JSON)
+                        .content("{\"flowId\":\"" + FLOW_ID + "\",\"payload\":{}}"))
+                .andExpect(status().isAccepted());
+
+        verify(auditLog).record(EXECUTION_ID, AuditEventType.TRIGGER_RECEIVED, null, CurrentUser.ANONYMOUS,
+                Map.of("flowId", FLOW_ID, "trigger", "manual"));
+    }
+
+    @Test
     void manual_missingFlowId_rejectedWithoutRouting() throws Exception {
         mvc.perform(post("/api/triggers/manual")
                         .contentType(MediaType.APPLICATION_JSON)
@@ -124,6 +159,6 @@ class TriggerControllerTest {
                 .andExpect(status().is(422))
                 .andExpect(jsonPath("$.error").value(containsString("flowId")));
 
-        verifyNoInteractions(router);
+        verifyNoInteractions(router, auditLog);
     }
 }

@@ -66,17 +66,23 @@ class DashboardControllerTest {
         verify(service).compute(30);
     }
 
+    /**
+     * The window constraint lives in the service, next to the cache whose key space it
+     * bounds; the controller must let that rejection surface rather than serve a body.
+     */
     @Test
-    void stats_daysTooSmall_unprocessable() throws Exception {
-        mvc.perform(get("/api/dashboard/stats").param("days", "0"))
-                .andExpect(status().is(422));
-        verifyNoInteractions(service);
+    void stats_unlistedWindow_unprocessable() throws Exception {
+        when(service.compute(13)).thenThrow(new IllegalArgumentException("days must be one of [1, 7, 14, 30, 90]"));
+
+        mvc.perform(get("/api/dashboard/stats").param("days", "13"))
+                .andExpect(status().is(422))
+                .andExpect(jsonPath("$.error").value("days must be one of [1, 7, 14, 30, 90]"));
     }
 
     @Test
-    void stats_daysTooLarge_unprocessable() throws Exception {
-        mvc.perform(get("/api/dashboard/stats").param("days", "91"))
-                .andExpect(status().is(422));
+    void stats_nonNumericDays_badRequest() throws Exception {
+        mvc.perform(get("/api/dashboard/stats").param("days", "all"))
+                .andExpect(status().isBadRequest());
         verifyNoInteractions(service);
     }
 }

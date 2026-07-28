@@ -1,5 +1,6 @@
 package org.folio.factory.app.web;
 
+import org.folio.factory.app.security.CurrentUser;
 import org.folio.factory.core.domain.HitlReview;
 import org.folio.factory.core.domain.HitlReviewStatus;
 import org.folio.factory.core.hitl.HitlDecision;
@@ -21,6 +22,7 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import org.springframework.web.servlet.view.InternalResourceViewResolver;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.security.Principal;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -45,6 +47,7 @@ class ReviewUiControllerTest {
 
     private static final UUID EXECUTION_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
     private static final UUID REVIEW_ID = UUID.fromString("00000000-0000-0000-0000-0000000000aa");
+    private static final Principal QA_LEAD = () -> "qa-lead";
 
     private final JsonMapper json = JsonMapper.builder().build();
 
@@ -70,14 +73,14 @@ class ReviewUiControllerTest {
     @Test
     void decide_amend_forwardsOnlyArtifactPrefixedParamsWithPrefixStripped() throws Exception {
         mvc.perform(post("/reviews/{id}/decision", REVIEW_ID)
+                        .principal(QA_LEAD)
                         .param("decision", "AMEND")
-                        .param("reviewer", "qa")
                         .param("artifact:test_plan.md", "new content")
                         .param("unrelated", "x"))
                 .andExpect(status().is3xxRedirection())
                 .andExpect(redirectedUrl("/reviews"));
 
-        verify(decisionService).decide(eq(REVIEW_ID), eq(HitlDecision.AMEND), eq("qa"), isNull(),
+        verify(decisionService).decide(eq(REVIEW_ID), eq(HitlDecision.AMEND), eq("qa-lead"), isNull(),
                 amendmentsCaptor.capture());
         assertThat(amendmentsCaptor.getValue()).containsExactlyEntriesOf(Map.of("test_plan.md", "new content"));
     }
@@ -85,22 +88,46 @@ class ReviewUiControllerTest {
     @Test
     void decide_approve_ignoresArtifactParams() throws Exception {
         mvc.perform(post("/reviews/{id}/decision", REVIEW_ID)
+                        .principal(QA_LEAD)
                         .param("decision", "APPROVE")
-                        .param("reviewer", "qa")
                         .param("artifact:test_plan.md", "should be ignored"))
                 .andExpect(status().is3xxRedirection())
                 .andExpect(redirectedUrl("/reviews"));
 
-        verify(decisionService).decide(eq(REVIEW_ID), eq(HitlDecision.APPROVE), eq("qa"), isNull(),
+        verify(decisionService).decide(eq(REVIEW_ID), eq(HitlDecision.APPROVE), eq("qa-lead"), isNull(),
                 amendmentsCaptor.capture());
         assertThat(amendmentsCaptor.getValue()).isEmpty();
     }
 
     @Test
+    void decide_reviewerFormField_ignoredInFavourOfAuthenticatedPrincipal() throws Exception {
+        mvc.perform(post("/reviews/{id}/decision", REVIEW_ID)
+                        .principal(QA_LEAD)
+                        .param("decision", "APPROVE")
+                        .param("reviewer", "someone-else"))
+                .andExpect(status().is3xxRedirection())
+                .andExpect(redirectedUrl("/reviews"));
+
+        verify(decisionService).decide(eq(REVIEW_ID), eq(HitlDecision.APPROVE), eq("qa-lead"), isNull(), any());
+    }
+
+    @Test
+    void decide_withoutPrincipal_recordsAnonymousRatherThanAnyFormSuppliedName() throws Exception {
+        mvc.perform(post("/reviews/{id}/decision", REVIEW_ID)
+                        .param("decision", "APPROVE")
+                        .param("reviewer", "someone-else"))
+                .andExpect(status().is3xxRedirection())
+                .andExpect(redirectedUrl("/reviews"));
+
+        verify(decisionService).decide(eq(REVIEW_ID), eq(HitlDecision.APPROVE), eq(CurrentUser.ANONYMOUS),
+                isNull(), any());
+    }
+
+    @Test
     void decide_invalidDecision_redirectsWithEncodedErrorWithoutDelegation() throws Exception {
         mvc.perform(post("/reviews/{id}/decision", REVIEW_ID)
-                        .param("decision", "MAYBE")
-                        .param("reviewer", "qa"))
+                        .principal(QA_LEAD)
+                        .param("decision", "MAYBE"))
                 .andExpect(status().is3xxRedirection())
                 .andExpect(result -> assertThat(result.getResponse().getRedirectedUrl())
                         .startsWith("/reviews/" + REVIEW_ID + "?error=")
@@ -111,24 +138,24 @@ class ReviewUiControllerTest {
 
     @Test
     void decide_serviceRejects_redirectsWithEncodedMessage() throws Exception {
-        when(decisionService.decide(REVIEW_ID, HitlDecision.APPROVE, "qa", null, Map.of()))
+        when(decisionService.decide(REVIEW_ID, HitlDecision.APPROVE, "qa-lead", null, Map.of()))
                 .thenThrow(new IllegalArgumentException("boom message"));
 
         mvc.perform(post("/reviews/{id}/decision", REVIEW_ID)
-                        .param("decision", "APPROVE")
-                        .param("reviewer", "qa"))
+                        .principal(QA_LEAD)
+                        .param("decision", "APPROVE"))
                 .andExpect(status().is3xxRedirection())
                 .andExpect(redirectedUrl("/reviews/" + REVIEW_ID + "?error=boom+message"));
     }
 
     @Test
     void decide_concurrentDecision_redirectsWithFriendlyMessage() throws Exception {
-        when(decisionService.decide(REVIEW_ID, HitlDecision.APPROVE, "qa", null, Map.of()))
+        when(decisionService.decide(REVIEW_ID, HitlDecision.APPROVE, "qa-lead", null, Map.of()))
                 .thenThrow(new OptimisticLockingFailureException("row was updated by another transaction"));
 
         mvc.perform(post("/reviews/{id}/decision", REVIEW_ID)
-                        .param("decision", "APPROVE")
-                        .param("reviewer", "qa"))
+                        .principal(QA_LEAD)
+                        .param("decision", "APPROVE"))
                 .andExpect(status().is3xxRedirection())
                 .andExpect(result -> assertThat(result.getResponse().getRedirectedUrl())
                         .startsWith("/reviews/" + REVIEW_ID + "?error=")

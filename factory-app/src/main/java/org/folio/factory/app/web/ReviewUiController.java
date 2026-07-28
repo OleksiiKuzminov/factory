@@ -1,5 +1,6 @@
 package org.folio.factory.app.web;
 
+import org.folio.factory.app.security.CurrentUser;
 import org.folio.factory.core.domain.HitlReview;
 import org.folio.factory.core.domain.HitlReviewStatus;
 import org.folio.factory.core.hitl.HitlDecision;
@@ -20,6 +21,7 @@ import org.springframework.web.servlet.mvc.support.RedirectAttributes;
 import tools.jackson.databind.JsonNode;
 import tools.jackson.databind.json.JsonMapper;
 
+import java.security.Principal;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -100,10 +102,12 @@ public class ReviewUiController {
     @PostMapping("/reviews/{id}/decision")
     public String decide(@PathVariable("id") UUID id,
                          @RequestParam("decision") String decision,
-                         @RequestParam("reviewer") String reviewer,
                          @RequestParam(name = "comments", required = false) String comments,
                          @RequestParam Map<String, String> allParams,
+                         Principal principal,
                          RedirectAttributes redirect) {
+        // Never a form field: the ledger's reviewer is the signed-in user.
+        String reviewer = CurrentUser.name(principal);
         // The whole form processing sits inside one try so validation failures
         // redirect back to the review page instead of falling through to the
         // REST API's JSON exception handler. Unchanged-artifact filtering happens

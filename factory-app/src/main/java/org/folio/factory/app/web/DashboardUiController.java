@@ -31,7 +31,6 @@ import java.util.EnumMap;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.TreeMap;
 
 /**
@@ -45,7 +44,6 @@ public class DashboardUiController {
 
     private static final int DEFAULT_DAYS = 14;
     private static final int DEFAULT_AUDIT_SIZE = 50;
-    private static final Set<Integer> ALLOWED_DAYS = Set.of(1, 7, 14, 30, 90);
 
     private final List<ConnectorHealth> connectors;
     private final FlowRegistry flowRegistry;
@@ -76,7 +74,9 @@ public class DashboardUiController {
 
     @GetMapping("/")
     public String dashboard(@RequestParam(name = "days", defaultValue = "14") int days, Model model) {
-        int window = ALLOWED_DAYS.contains(days) ? days : DEFAULT_DAYS;
+        // Clamped against the service's own list — a window it would reject reaches
+        // compute() as an IllegalArgumentException and 500s the page, not 422s it.
+        int window = DashboardStatsService.ALLOWED_WINDOWS.contains(days) ? days : DEFAULT_DAYS;
         model.addAttribute("days", window);
 
         Map<ExecutionStatus, Long> byStatus = new EnumMap<>(ExecutionStatus.class);

@@ -8,6 +8,7 @@ import org.folio.factory.app.web.dashboard.DashboardStats.StatusCount;
 import org.folio.factory.app.web.dashboard.DashboardStats.StepFailureCount;
 import org.folio.factory.app.web.dashboard.DashboardStats.StepTokenCount;
 import org.folio.factory.app.web.dashboard.DashboardStats.TokenUsage;
+import org.springframework.boot.context.properties.EnableConfigurationProperties;
 import org.springframework.jdbc.core.simple.JdbcClient;
 import org.springframework.stereotype.Service;
 
@@ -17,23 +18,74 @@ import java.time.OffsetDateTime;
 import java.time.ZoneOffset;
 import java.time.temporal.ChronoUnit;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Aggregates execution/audit/HITL metrics for the dashboard charts in one payload.
  * Uses native Postgres SQL through {@link JdbcClient}: {@code date_trunc},
  * {@code FILTER (WHERE ...)} and {@code detail->>'connector'} are inexpressible in
  * JPQL, and the project is Postgres-only.
+ *
+ * <p>Every entry point serves a snapshot cached per window for
+ * {@code factory.dashboard.stats-cache-ttl}: the aggregates are unwindowed group-bys
+ * over {@code pipeline_execution} and scans of the append-only {@code audit_event}
+ * table (which retention never purges), so re-running them per dashboard load — and
+ * per 30s chart poll, per viewer — does not scale with the ledger.</p>
  */
 @Service
+@EnableConfigurationProperties(DashboardProperties.class)
 public class DashboardStatsService {
 
-    private final JdbcClient jdbc;
+    /** The windows the console offers; anything else is refused so the cache stays bounded. */
+    public static final List<Integer> ALLOWED_WINDOWS = List.of(1, 7, 14, 30, 90);
 
-    public DashboardStatsService(JdbcClient jdbc) {
+    private final JdbcClient jdbc;
+    private final long cacheTtlNanos;
+    private final Map<Integer, Snapshot> cached = new ConcurrentHashMap<>();
+
+    public DashboardStatsService(JdbcClient jdbc, DashboardProperties properties) {
         this.jdbc = jdbc;
+        this.cacheTtlNanos = properties.statsCacheTtl().toNanos();
     }
 
+    /**
+     * The cached snapshot for {@code days}, refreshed once its TTL has passed. Each
+     * window keeps its own entry, so two viewers on different ranges neither evict
+     * each other nor ever see the other's numbers. Deliberately unsynchronised: a
+     * refresh racing another merely aggregates twice, whereas a lock would queue
+     * every dashboard request behind one slow scan. A refresh that throws stores
+     * nothing, so the next call retries instead of caching the failure.
+     *
+     * @throws IllegalArgumentException if {@code days} is not one of {@link #ALLOWED_WINDOWS}
+     */
     public DashboardStats compute(int days) {
+        if (!ALLOWED_WINDOWS.contains(days)) {
+            throw new IllegalArgumentException("days must be one of " + ALLOWED_WINDOWS);
+        }
+        if (cacheTtlNanos <= 0) {
+            return aggregate(days);
+        }
+        Snapshot current = cached.get(days);
+        if (current != null && System.nanoTime() - current.expiresAtNanos() < 0) {
+            return current.stats();
+        }
+        DashboardStats fresh = aggregate(days);
+        cached.put(days, new Snapshot(fresh, System.nanoTime() + cacheTtlNanos));
+        return fresh;
+    }
+
+    /** Window totals for the token KPI card; the UI renders these without the rest of the payload. */
+    public TokenUsage tokenUsage(int days) {
+        return compute(days).tokens();
+    }
+
+    /** Per-flow, per-step token spend, heaviest first. */
+    public List<StepTokenCount> stepTokens(int days) {
+        return compute(days).stepTokens();
+    }
+
+    private DashboardStats aggregate(int days) {
         OffsetDateTime since = since(days);
 
         PendingRow pending = pending();
@@ -45,16 +97,6 @@ public class DashboardStatsService {
                 executionsByStatus(), executionsByFlowAndStatus(), executionsPerDay(since),
                 stepFailures(since), hitl, connectorOutcomes(since),
                 tokenUsage(since), stepTokens(since));
-    }
-
-    /** Window totals for the token KPI card; the UI renders these without the rest of the payload. */
-    public TokenUsage tokenUsage(int days) {
-        return tokenUsage(since(days));
-    }
-
-    /** Per-flow, per-step token spend, heaviest first. */
-    public List<StepTokenCount> stepTokens(int days) {
-        return stepTokens(since(days));
     }
 
     private static OffsetDateTime since(int days) {
@@ -143,7 +185,8 @@ public class DashboardStatsService {
         return jdbc.sql("""
                         SELECT detail->>'connector' AS connector, event_type, count(*) AS c
                         FROM audit_event
-                        WHERE event_type IN ('CONNECTOR_ACTION', 'CONNECTOR_SKIPPED') AND occurred_at >= :since
+                        WHERE event_type IN ('CONNECTOR_ACTION', 'CONNECTOR_SKIPPED', 'CONNECTOR_FAILED')
+                          AND occurred_at >= :since
                         GROUP BY 1, 2
                         """)
                 .param("since", since)
@@ -171,6 +214,9 @@ public class DashboardStatsService {
                 .param("since", since)
                 .query((rs, n) -> new DecidedRow(rs.getLong("c"), (Double) rs.getObject("avg_s")))
                 .single();
+    }
+
+    private record Snapshot(DashboardStats stats, long expiresAtNanos) {
     }
 
     private record PendingRow(long count, Double oldestSeconds) {

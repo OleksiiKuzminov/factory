@@ -76,6 +76,7 @@ class TestFactoryZeroCredentialsTest {
                 """));
 
         approveGate(executionId, "gate-1-test-plan");
+        approveGate(executionId, "gate-script-review");
         approveGate(executionId, "gate-2-signoff");
 
         await().atMost(Duration.ofSeconds(30)).untilAsserted(() ->

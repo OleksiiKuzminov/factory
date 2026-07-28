@@ -1,0 +1,27 @@
+# Two SUB_FLOW steps in one chain — the shape Flow E needs. A child of the FIRST
+# step stays COMPLETED while the parent waits on the SECOND, so the reconciler's
+# child selection must be correlated to the step the parent is actually parked on.
+id: fake-two-subflows
+name: Fake Two Sub-Flows Flow
+version: 1.0.0
+agent_chain:
+  - step_id: produce
+    type: AGENT
+    worker_id: echo-worker
+    outputs: [parent_doc.md]
+  - step_id: delegate-first
+    type: SUB_FLOW
+    sub_flow:
+      flow_id: fake-child
+      input_mapping:
+        parent_doc.md: child_input.md
+      output_mapping:
+        child_output.md: collected.md
+  - step_id: delegate-second
+    type: SUB_FLOW
+    sub_flow:
+      flow_id: fake-child
+      input_mapping:
+        collected.md: child_input.md
+      output_mapping:
+        child_output.md: second_collected.md

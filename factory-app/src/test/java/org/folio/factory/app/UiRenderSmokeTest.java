@@ -14,6 +14,8 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.boot.test.context.SpringBootTest;
 import org.springframework.boot.test.web.server.LocalServerPort;
 import org.springframework.boot.testcontainers.service.connection.ServiceConnection;
+import org.springframework.test.context.DynamicPropertyRegistry;
+import org.springframework.test.context.DynamicPropertySource;
 import org.springframework.context.annotation.Import;
 import org.springframework.data.domain.Page;
 import org.springframework.data.domain.PageImpl;
@@ -39,12 +41,26 @@ import static org.assertj.core.api.Assertions.assertThat;
  * standalone MockMvc controller tests never resolve the layout/component
  * fragments. Boots the app, seeds one execution + review, and asserts every
  * UI page renders through the shared layout.
+ *
+ * <p>Runs with authentication on and signs every request in with HTTP Basic, so the
+ * layout's session controls render the way a real signed-in console does. The
+ * dashboard snapshot cache is disabled because two methods share one context and the
+ * second seeds new token rows a cached snapshot would hide.</p>
  */
 @SpringBootTest(webEnvironment = SpringBootTest.WebEnvironment.RANDOM_PORT,
-        properties = {"spring.ai.model.chat=none", "factory.engine.enabled=false"})
+        properties = {"spring.ai.model.chat=none", "factory.engine.enabled=false",
+                "factory.dashboard.stats-cache-ttl=0s"})
 @Import(StubLlmConfiguration.class)
 @Testcontainers
 class UiRenderSmokeTest {
+
+    private static final String USER = TestAuthCredentials.USER;
+    private static final String PASSWORD = TestAuthCredentials.PASSWORD;
+
+    @DynamicPropertySource
+    static void authProperties(DynamicPropertyRegistry registry) {
+        TestAuthCredentials.register(registry);
+    }
 
     @Container
     @ServiceConnection
@@ -70,9 +86,16 @@ class UiRenderSmokeTest {
 
     private RestClient rest;
 
+    /** No credentials: for the pages that must render before anyone has signed in. */
+    private RestClient anonymous;
+
     @BeforeEach
     void setUp() {
-        rest = RestClient.builder().baseUrl("http://localhost:" + port).build();
+        rest = RestClient.builder()
+                .baseUrl("http://localhost:" + port)
+                .defaultHeaders(headers -> headers.setBasicAuth(USER, PASSWORD))
+                .build();
+        anonymous = RestClient.builder().baseUrl("http://localhost:" + port).build();
     }
 
     @Test
@@ -96,6 +119,32 @@ class UiRenderSmokeTest {
                 // Grouped thousands, and the per-step row reached the table body.
                 .contains("2,139")
                 .contains("test-automation");
+    }
+
+    @Test
+    void loginPageRendersWithoutCredentialsAndOutsideTheConsoleShell() {
+        ResponseEntity<String> response = anonymous.get().uri("/login").retrieve().toEntity(String.class);
+
+        assertThat(response.getStatusCode()).isEqualTo(HttpStatus.OK);
+        assertThat(response.getBody())
+                .contains("for=\"username\"")
+                .contains("for=\"password\"")
+                // Rendered by Spring Security's RequestDataValueProcessor; without it the
+                // form would be rejected by the console chain's own CSRF filter.
+                .contains("name=\"_csrf\"")
+                .contains("/css/tokens.css")
+                // No sidebar to navigate: the login page deliberately bypasses the layout.
+                .doesNotContain("app-shell");
+    }
+
+    @Test
+    void signedInLayoutShowsTheUserAndAPostLogoutControl() {
+        String body = assertRendered("/", "Dashboard");
+        assertThat(body)
+                .contains("Signed in as")
+                .contains(USER)
+                .contains("action=\"/logout\"")
+                .contains("Sign out");
     }
 
     @Test
@@ -123,7 +172,7 @@ class UiRenderSmokeTest {
         PipelineExecution execution = executions.save(new PipelineExecution("test-factory", "1", "{}"));
         HitlReview review = reviews.save(new HitlReview(execution.getId(), "gate-2-signoff", 5,
                 "{\"title\":\"Signed-off plan\",\"flowId\":\"test-factory\"}"));
-        review.decide(HitlReviewStatus.AMENDED, "AMEND", "qa-lead", "tightened", null);
+        review.decide(HitlReviewStatus.AMENDED, "AMEND", USER, "tightened", null);
         reviews.save(review);
 
         // The ALL tab is not the PENDING path: it must render the decided review and

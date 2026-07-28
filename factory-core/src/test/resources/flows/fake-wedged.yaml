@@ -1,0 +1,12 @@
+# A step that outlives the heartbeat budget the heartbeat tests configure, standing in
+# for a worker wedged on a hung socket: the lease must stop being defended.
+id: fake-wedged
+name: Fake Wedged Flow
+version: 1.0.0
+agent_chain:
+  - step_id: wedged
+    type: AGENT
+    worker_id: slow-worker
+    outputs: [wedged.md]
+    config:
+      sleep_millis: 8000

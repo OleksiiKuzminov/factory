@@ -68,6 +68,11 @@ public class StateManager {
         return saved;
     }
 
+    /**
+     * Creates a sub-flow child and records it on the parent as the invocation the
+     * parent is now waiting on, superseding any earlier child of the same step. That
+     * pointer is what the recovery sweeps correlate on.
+     */
     @Transactional
     public PipelineExecution createChildExecution(String flowId, String flowVersion, String triggerPayloadJson,
                                                   UUID parentExecutionId, int parentStepIndex) {
@@ -75,6 +80,9 @@ public class StateManager {
         execution.setParentExecutionId(parentExecutionId);
         execution.setParentStepIndex(parentStepIndex);
         PipelineExecution saved = executions.save(execution);
+        PipelineExecution parent = load(parentExecutionId);
+        parent.setAwaitingChildExecutionId(saved.getId());
+        executions.save(parent);
         auditLog.record(saved.getId(), AuditEventType.EXECUTION_STARTED, null,
                 Map.of("flowId", flowId, "flowVersion", flowVersion,
                         "parentExecutionId", parentExecutionId.toString()));
@@ -116,6 +124,12 @@ public class StateManager {
      * FAILED_ESCALATED is deliberately NOT terminal here: such a child has a
      * pending escalation review and can still be resumed, so the parent keeps
      * waiting — per the design, a parent waits through its sub-flow's reviews.
+     *
+     * <p>Escalating is idempotent per invocation because the query only returns the
+     * child the parent is actually parked on: once an approved escalation re-invokes
+     * the sub-flow, the child that caused it is superseded and stops matching, so the
+     * fresh child running under the parent is never orphaned by a second
+     * escalation.</p>
      */
     @Transactional(readOnly = true)
     public List<PipelineExecution> findTerminatedChildren() {

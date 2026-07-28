@@ -35,16 +35,26 @@ public interface PipelineExecutionRepository extends JpaRepository<PipelineExecu
     List<PipelineExecution> findByParentExecutionId(UUID parentExecutionId);
 
     /**
-     * Child executions in one of the given states whose parent is still waiting on
-     * them. Scoped to waiting parents so periodic reconciliation stays cheap as
-     * finished executions accumulate over time.
+     * Child executions in one of the given states that their parent is still waiting
+     * on. Scoped to waiting parents so periodic reconciliation stays cheap as finished
+     * executions accumulate over time, and correlated through the parent's
+     * awaitingChildExecutionId so only the one invocation the parent is blocked on
+     * matches. That correlation is load-bearing — a superseded child (an escalation
+     * approval re-invoked the step, or an earlier SUB_FLOW step finished while a later
+     * one runs) otherwise keeps matching every sweep, re-escalating a parent that
+     * already resumed or re-copying a finished step's outputs. It is a stored pointer
+     * rather than a "newest child" comparison because created_at carries the clock of
+     * whichever instance inserted the row: NTP steps and inter-instance skew would
+     * make the newer child look older.
      */
     @Query("""
             SELECT c FROM PipelineExecution c
             WHERE c.status IN :statuses
               AND c.parentExecutionId IS NOT NULL
               AND EXISTS (SELECT p.id FROM PipelineExecution p
-                          WHERE p.id = c.parentExecutionId AND p.status = :parentStatus)
+                          WHERE p.id = c.parentExecutionId
+                            AND p.status = :parentStatus
+                            AND p.awaitingChildExecutionId = c.id)
             """)
     List<PipelineExecution> findChildrenWithWaitingParent(
             @Param("statuses") List<ExecutionStatus> statuses,
